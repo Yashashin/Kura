@@ -1,0 +1,15 @@
+# UE build artifacts
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+
+# Python
+__pycache__/
+*.pyc
+
+# Visual Studio
+.vs/
+*.sln
+*.suo
+*.user

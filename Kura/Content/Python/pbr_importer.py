@@ -1,0 +1,358 @@
+"""PBR Material Importer (Kura SPEC F6) - standalone companion tool.
+
+Turns a folder of downloaded PBR texture sets into ready-to-use Material
+Instances: one disk subfolder = one set, textures are matched to material
+parameters by filename keyword, imported with the right settings (sRGB /
+compression / normal flip) and wired into a new MI under the user's master
+material.
+
+Deliberately independent of the kura package: no kura imports, usable in any
+project by calling scan()/commit() from Python. The Kura panel drives it via
+kura.editor_api's thin pbr_* wrappers. Editor-only (asset import + MI creation
+need the editor; headless import crashes in commandlets - Phase 0 finding).
+"""
+import json
+import os
+import re
+
+try:
+    import unreal
+except ImportError:  # offline tests exercise scan()'s matching logic only
+    unreal = None
+
+CONFIG_FILE = os.path.join(os.environ.get("APPDATA", ""), "Kura",
+                           "pbr_importer.json")
+KURA_CONFIG_FILE = os.path.join(os.environ.get("APPDATA", ""), "Kura",
+                                "config.json")
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tga", ".exr", ".tif", ".tiff",
+              ".bmp", ".hdr")
+
+# Filename keyword -> master material parameter + import settings (SPEC F6).
+# Keywords are matched against whole filename tokens (split on non-alnum),
+# never as substrings - "arm" must not match "farmhouse". Editable via
+# pbr_importer.json {"rules": [...]}.
+DEFAULT_RULES = [
+    {"type": "BaseColor",
+     "keywords": ["basecolor", "albedo", "diffuse", "diff", "col", "color"],
+     "param": "Base Color Texture", "switch": "Use Base Color Texture",
+     "srgb": True, "compression": "default"},
+    {"type": "Normal",
+     "keywords": ["normal", "nor", "nrm", "normalgl", "normaldx"],
+     "param": "Normal Texture", "switch": "Use Normal Texture",
+     "srgb": False, "compression": "normalmap"},
+    {"type": "ORM",
+     "keywords": ["orm", "arm"],
+     "param": "ORM Texture", "switch": "Use ORM Texture",
+     "srgb": False, "compression": "masks"},
+    {"type": "Roughness",
+     "keywords": ["roughness", "rough"],
+     "param": "Roughness Texture", "switch": "Use Roughness Texture",
+     "srgb": False, "compression": "default"},
+    {"type": "Metallic",
+     "keywords": ["metallic", "metalness", "metal"],
+     "param": "Metallic Texture", "switch": "Use Metallic Texture",
+     "srgb": False, "compression": "default"},
+    {"type": "AO",
+     "keywords": ["ao", "ambientocclusion", "occlusion"],
+     "param": "AO Texture", "switch": "Use AO Texture",
+     "srgb": False, "compression": "default"},
+]
+
+# Packed ORM wins over separate maps (SPEC F6); the loose ones are reported.
+SEPARATE_TYPES = ("Roughness", "Metallic", "AO")
+
+
+def _load_config():
+    cfg = {"master_material": "", "last_category": "", "flip_green": False,
+           "rules": DEFAULT_RULES}
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def _save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass  # remembering defaults is best-effort
+
+
+def _lib_prefix():
+    """Stable path prefix, read straight from Kura's config.json (a plain
+    file read - still no kura import)."""
+    try:
+        with open(KURA_CONFIG_FILE, encoding="utf-8") as f:
+            return json.load(f).get("lib_prefix", "/Game/_AssetLib")
+    except (OSError, ValueError):
+        return "/Game/_AssetLib"
+
+
+def defaults():
+    cfg = _load_config()
+    return {"master_material": cfg["master_material"],
+            "category": cfg["last_category"],
+            "flip_green": bool(cfg["flip_green"])}
+
+
+def _clean_name(name):
+    """UE asset names: keep alnum/underscore/hyphen, collapse the rest."""
+    return re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9_\-]", "_", name)).strip("_")
+
+
+def _clean_category(category):
+    parts = [p for p in re.split(r"[\\/]+", str(category).strip()) if p]
+    return "/".join(_clean_name(p) for p in parts)
+
+
+def _tokens(filename):
+    return [t for t in re.split(r"[^a-z0-9]+",
+                                os.path.splitext(filename)[0].lower()) if t]
+
+
+def _match_rule(filename, rules):
+    toks = set(_tokens(filename))
+    for rule in rules:
+        if toks & set(k.lower() for k in rule["keywords"]):
+            return rule
+    return None
+
+
+def _asset_exists(path):
+    return bool(unreal) and unreal.EditorAssetLibrary.does_asset_exist(path)
+
+
+def scan(root_dir, category):
+    """Dry-run (SPEC F6): group subfolders into sets, match files to rules,
+    flag ambiguities and occupied targets. Never touches assets.
+
+    Returns {"ok", "errors", "sets": [{name, mi, textures: [{file, type,
+    param, dest}], unmatched, errors}]}; a set with errors is skipped by
+    commit().
+    """
+    root_dir = str(root_dir)
+    category = _clean_category(category)
+    if not os.path.isdir(root_dir):
+        return {"ok": False, "errors": ["Not a folder: %s" % root_dir],
+                "sets": []}
+    if not category:
+        return {"ok": False, "errors": ["Category is required (the subfolder "
+                                        "the sets are created under)"],
+                "sets": []}
+
+    rules = _load_config()["rules"]
+    prefix = _lib_prefix()
+    sets = []
+    for sub in sorted(os.listdir(root_dir)):
+        set_dir = os.path.join(root_dir, sub)
+        if not os.path.isdir(set_dir):
+            continue
+        set_name = _clean_name(sub)
+        # One folder per set, MI and its textures together (SPEC 5.4 co-locate
+        # convention, 2026-08-10) - the textures belong to this MI alone.
+        set_folder = "%s/%s/%s" % (prefix, category, set_name)
+        mi_name = "MI_%s" % set_name
+        info = {"name": set_name, "mi": "%s/%s" % (set_folder, mi_name),
+                "textures": [], "unmatched": [], "errors": []}
+
+        by_type = {}
+        for dirpath, _dirs, files in os.walk(set_dir):
+            for fname in sorted(files):
+                if os.path.splitext(fname)[1].lower() not in IMAGE_EXTS:
+                    continue
+                rule = _match_rule(fname, rules)
+                if rule is None:
+                    info["unmatched"].append(fname)
+                    continue
+                by_type.setdefault(rule["type"], []).append(
+                    (os.path.join(dirpath, fname), rule))
+
+        # Ambiguity: two files for one slot (e.g. 2K + 4K, or nor_gl + nor_dx)
+        for map_type, matches in sorted(by_type.items()):
+            if len(matches) > 1:
+                info["errors"].append(
+                    "Multiple files match %s: %s - keep one and rescan"
+                    % (map_type, ", ".join(os.path.basename(m[0])
+                                           for m in matches)))
+        # ORM beats separate maps; demote the losers to the unmatched list
+        if "ORM" in by_type:
+            for sep in SEPARATE_TYPES:
+                if sep in by_type:
+                    info["unmatched"].extend(
+                        os.path.basename(m[0]) for m in by_type.pop(sep))
+        if not by_type:
+            info["errors"].append("No recognized textures in this folder")
+
+        for map_type, matches in sorted(by_type.items()):
+            src, rule = matches[0]
+            dest = "T_%s_%s" % (set_name, map_type)
+            info["textures"].append({"file": os.path.basename(src),
+                                     "path": src, "type": map_type,
+                                     "param": rule["param"], "dest": dest})
+            if _asset_exists("%s/%s" % (set_folder, dest)):
+                info["errors"].append("Target already exists: %s/%s"
+                                      % (set_folder, dest))
+        if _asset_exists(info["mi"]):
+            info["errors"].append("Target already exists: %s" % info["mi"])
+
+        sets.append(info)
+
+    if not sets:
+        return {"ok": False, "sets": [],
+                "errors": ["No subfolders found - each texture set must be "
+                           "one subfolder of the chosen folder"]}
+    return {"ok": True, "errors": [], "sets": sets}
+
+
+COMPRESSION = {}
+if unreal:
+    COMPRESSION = {
+        "default": unreal.TextureCompressionSettings.TC_DEFAULT,
+        "normalmap": unreal.TextureCompressionSettings.TC_NORMALMAP,
+        "masks": unreal.TextureCompressionSettings.TC_MASKS,
+    }
+
+
+def _import_texture(src, folder, dest, rule, flip_green):
+    task = unreal.AssetImportTask()
+    task.filename = src
+    task.destination_path = folder
+    task.destination_name = dest
+    task.automated = True
+    task.save = False
+    task.replace_existing = False
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    tex = unreal.load_asset("%s/%s.%s" % (folder, dest, dest))
+    if not tex:
+        return None
+    # Import settings are the easy-to-forget half of the manual workflow.
+    tex.set_editor_property("srgb", bool(rule["srgb"]))
+    tex.set_editor_property("compression_settings",
+                            COMPRESSION.get(str(rule["compression"]).lower(),
+                                            COMPRESSION["default"]))
+    if rule["type"] == "Normal" and flip_green:
+        tex.set_editor_property("flip_green_channel", True)
+    unreal.EditorAssetLibrary.save_loaded_asset(tex, False)
+    return tex
+
+
+class _Progress:
+    """Slow-task dialog for the import loop (2026-08-02).
+
+    Deliberately a local copy of kura.progress.Reporter: this module must not
+    import kura (module docstring). Skipped when unreal is missing (offline
+    tests) or in a commandlet, where Slate calls crash past Python's reach.
+    """
+
+    def __init__(self, title):
+        self._title = str(title)
+        self._task = None
+        self._enabled = bool(unreal) and not (
+            "-run=" in str(unreal.SystemLibrary.get_command_line()).lower()
+            or "-unattended" in str(unreal.SystemLibrary.get_command_line()).lower())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        if self._task is not None:
+            self._task.__exit__(None, None, None)
+            self._task = None
+        return False
+
+    def __call__(self, done, total, label=""):
+        if not self._enabled:
+            return
+        if self._task is None:
+            self._task = unreal.ScopedSlowTask(float(max(int(total), 1)),
+                                               self._title)
+            self._task.__enter__()
+            self._task.make_dialog_delayed(0.5)
+        self._task.enter_progress_frame(1.0, str(label) or self._title)
+
+
+def commit(root_dir, category, master_path, flip_green=False):
+    """Import every non-blocked set and build its MI (SPEC F6). Re-scans so
+    the batch always reflects the disk right now."""
+    if not unreal:
+        return {"ok": False, "errors": ["Editor only - run inside UE"],
+                "created": [], "skipped": []}
+    master = unreal.load_asset(str(master_path))
+    if not master or not isinstance(master, unreal.MaterialInterface):
+        return {"ok": False, "created": [], "skipped": [],
+                "errors": ["Master material not found: %s" % master_path]}
+
+    result = scan(root_dir, category)
+    if not result["ok"]:
+        return {"ok": False, "created": [], "skipped": [],
+                "errors": result["errors"]}
+
+    rules_by_type = {r["type"]: r for r in _load_config()["rules"]}
+    mel = unreal.MaterialEditingLibrary
+    can_switch = hasattr(mel, "set_material_instance_static_switch_parameter_value")
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+    prefix = _lib_prefix()
+    category = _clean_category(category)
+    created, skipped, errors = [], [], []
+    if not can_switch:
+        errors.append("MaterialEditingLibrary has no static-switch setter in "
+                      "this engine version - Use * Texture switches were NOT "
+                      "set; enable them by hand in each MI")
+
+    sets = result["sets"]
+    with _Progress("PBR Importer: building material instances") as report:
+        for idx, info in enumerate(sets, 1):
+            report(idx, len(sets), info["name"])
+            if info["errors"]:
+                skipped.append(info["name"])
+                continue
+            set_folder = "%s/%s/%s" % (prefix, category, info["name"])
+
+            textures, failed = [], False
+            for item in info["textures"]:
+                rule = rules_by_type[item["type"]]
+                tex = _import_texture(item["path"], set_folder, item["dest"],
+                                      rule, flip_green)
+                if not tex:
+                    errors.append("%s: failed to import %s"
+                                  % (info["name"], item["file"]))
+                    failed = True
+                    break
+                textures.append((rule, tex))
+            if failed:
+                skipped.append(info["name"])
+                continue
+
+            mi = tools.create_asset("MI_%s" % info["name"], set_folder,
+                                    unreal.MaterialInstanceConstant,
+                                    unreal.MaterialInstanceConstantFactoryNew())
+            if not mi:
+                errors.append("%s: failed to create material instance"
+                              % info["name"])
+                skipped.append(info["name"])
+                continue
+            mel.set_material_instance_parent(mi, master)
+            for rule, tex in textures:
+                if can_switch:
+                    mel.set_material_instance_static_switch_parameter_value(
+                        mi, rule["switch"], True)
+                mel.set_material_instance_texture_parameter_value(
+                    mi, rule["param"], tex)
+            mel.update_material_instance(mi)
+            unreal.EditorAssetLibrary.save_loaded_asset(mi, False)
+            created.append(info["mi"])
+
+    cfg = _load_config()
+    cfg.update({"master_material": str(master_path),
+                "last_category": category, "flip_green": bool(flip_green)})
+    _save_config(cfg)
+
+    unreal.log("PBR Importer: created %d MI(s), skipped %d set(s)"
+               % (len(created), len(skipped)))
+    return {"ok": not errors, "created": created, "skipped": skipped,
+            "errors": errors}

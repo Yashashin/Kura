@@ -1,0 +1,422 @@
+"""Kura package (.kurapack) export / import (SPEC F7).
+
+A package is a portable slice of the library: a zip holding the asset-tree
+files, their Meta mirror (json + thumbnail PNG) and a manifest. Import goes
+into the LIBRARY (not the project) and reuses the core identity rules with
+no special cases: path = identity, hash = version, conflicts always prompt.
+Meta json travels as-is - tags / notes / is_root survive the trip.
+
+No unreal imports here - this module must stay usable outside the editor
+(future standalone browser, SPEC 2). editor_api passes the editor's engine
+version in for the import guard.
+"""
+import json
+import os
+import shutil
+import zipfile
+
+from . import config, library, store
+
+FORMAT_VERSION = 1
+MANIFEST_NAME = "kurapack.json"
+EXTENSION = ".kurapack"
+
+
+_version_tuple = store.version_tuple
+
+
+def _safe_rel(pkg):
+    """Library-relative path of a MANIFEST package, or raise ValueError.
+
+    Manifest paths are untrusted (packages are downloaded files): reject
+    traversal and separator tricks before anything reaches os.path.join,
+    or a malicious pack could stage files outside the library."""
+    rel = store.rel_path(pkg)  # raises unless under LIB_PREFIX
+    for part in rel.split("/"):
+        if part in ("", ".", "..") or "\\" in part or ":" in part:
+            raise ValueError("unsafe path component in %s" % pkg)
+    return rel
+
+
+# ---------------------------------------------------------------------------
+# Archive layout: mirrors the library root, so a package is self-describing
+# and can even be unzipped straight over a library by hand in a pinch.
+#   Content/_AssetLib/<rel>.uasset  |  Meta/<rel>.json  |  Meta/<rel>.png
+# ---------------------------------------------------------------------------
+
+def _content_base():
+    # "/Game/_AssetLib" -> "Content/_AssetLib" (SPEC 5.1 mirror)
+    return "Content/" + "/".join(config.LIB_PREFIX.strip("/").split("/")[1:])
+
+
+def _tree_name(rel):
+    return "%s/%s.uasset" % (_content_base(), rel)
+
+
+def _meta_name(rel):
+    return "Meta/%s.json" % rel
+
+
+def _thumb_name(rel):
+    return "Meta/%s.png" % rel
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+def export_package(packages, out_path, name="", description="", author="",
+                   progress=None):
+    """Write the entries' live dependency closure into a .kurapack (F7).
+
+    The closure is computed from the library graph at export time (same rule
+    as F3 import), so a package is always self-contained; /Engine/ deps are
+    recorded in each entry's meta and never packaged.
+    progress: optional progress(done, total, label) - this module stays
+    unreal-free, so kura.editor_api passes a kura.progress.Reporter.
+    Returns {"ok", "errors", "path", "entries", "bytes"}.
+    """
+    store.require_library_root()
+    roots = [str(p) for p in packages]
+    if not roots:
+        return {"ok": False, "errors": ["Nothing selected to export"]}
+    try:
+        closure = library.closure(roots)
+    except RuntimeError as e:
+        return {"ok": False, "errors": [str(e)]}
+
+    metas, errors = [], []
+    for pkg in closure:
+        meta = store.load_meta(pkg)
+        if meta is None:
+            errors.append("Library meta missing for %s (run Verify Library)" % pkg)
+        elif not os.path.isfile(store.tree_file(pkg)):
+            errors.append("Library file missing for %s (run Verify Library)" % pkg)
+        else:
+            metas.append(meta)
+    if errors:
+        return {"ok": False, "errors": errors}
+
+    out_path = str(out_path)
+    if not out_path.lower().endswith(EXTENSION):
+        out_path += EXTENSION
+    manifest = {
+        "format_version": FORMAT_VERSION,
+        "name": str(name) or os.path.splitext(os.path.basename(out_path))[0],
+        "description": str(description),
+        "author": str(author),
+        "created_at": store.now_iso(),
+        # Highest engine version inside; the import guard compares this first
+        # so an incompatible package is refused before anything is extracted.
+        "engine_version": max((m["engine_version"] for m in metas),
+                              key=_version_tuple),
+        "meta_schema_version": config.META_SCHEMA_VERSION,
+        "lib_prefix": config.LIB_PREFIX,
+        "entries": [{
+            "package": m["package"],
+            "class": m["class"],
+            "sha256": m["sha256"],
+            "size": m["size"],
+            "is_root": bool(m.get("is_root")),
+        } for m in metas],
+    }
+
+    tmp = out_path + ".kura-staging"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(MANIFEST_NAME,
+                       json.dumps(manifest, ensure_ascii=False, indent=2))
+            for idx, m in enumerate(metas, 1):
+                if progress is not None:
+                    progress(idx, len(metas), m["package"])
+                rel = store.rel_path(m["package"])
+                # .uasset payloads are mostly pre-compressed textures; store
+                # them raw so multi-GB packs write at copy speed. The small
+                # json/png sidecars keep the archive's default deflate.
+                z.write(store.tree_file(m["package"]), _tree_name(rel),
+                        zipfile.ZIP_STORED)
+                # Meta travels as-is except for the collection membership,
+                # whose ids only mean anything in THIS library's
+                # collections.json - which does not travel (SPEC F8). Stripped
+                # here as well as on import so a hand-unzipped package never
+                # shows a reader ids they cannot resolve.
+                shipped = dict(m)
+                shipped["collections"] = []
+                z.writestr(_meta_name(rel),
+                           json.dumps(shipped, ensure_ascii=False, indent=2))
+                thumb = store.thumb_file(m["package"])
+                if os.path.isfile(thumb):
+                    z.write(thumb, _thumb_name(rel))
+        os.replace(tmp, out_path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return {"ok": False, "errors": ["Package write failed: %s" % e]}
+    return {"ok": True, "errors": [], "path": out_path,
+            "entries": len(metas), "bytes": os.path.getsize(out_path)}
+
+
+# ---------------------------------------------------------------------------
+# Import
+# ---------------------------------------------------------------------------
+
+def _load_manifest(z):
+    """Manifest dict of an open zip, or raise ValueError with a user message."""
+    try:
+        manifest = json.loads(z.read(MANIFEST_NAME).decode("utf-8"))
+    except KeyError:
+        raise ValueError("Not a Kura package: %s is missing" % MANIFEST_NAME)
+    except ValueError:
+        raise ValueError("Not a Kura package: %s is unreadable" % MANIFEST_NAME)
+    # Shape-check untrusted input so a malformed manifest fails with one clear
+    # message instead of leaking a Python traceback into the error dialog.
+    try:
+        if (not isinstance(manifest, dict)
+                or not isinstance(manifest.get("entries", []), list)):
+            raise TypeError
+        int(manifest.get("format_version", 0))
+        int(manifest.get("meta_schema_version", 0))
+    except (TypeError, ValueError):
+        raise ValueError("Not a Kura package: malformed %s" % MANIFEST_NAME)
+    if int(manifest.get("format_version", 0)) > FORMAT_VERSION:
+        raise ValueError(
+            "This package was created by a newer Kura (package format %s, "
+            "this Kura reads up to %s) - update Kura to import it"
+            % (manifest.get("format_version"), FORMAT_VERSION))
+    if int(manifest.get("meta_schema_version", 0)) > config.META_SCHEMA_VERSION:
+        raise ValueError(
+            "This package carries meta schema %s but this Kura writes schema "
+            "%s - update Kura to import it"
+            % (manifest.get("meta_schema_version"), config.META_SCHEMA_VERSION))
+    return manifest
+
+
+def preview(pack_path, current_engine=None, force_version=False, progress=None):
+    """Compare a package against the library (F7 import steps 1-2).
+
+    Returns {"ok", "errors", "manifest", "items"}; item: {package, class,
+    status: new|same|conflict, size, sha256, referrers}. The wording of the
+    engine-guard error must keep "newer-engine" - the C++ flow keys its
+    force-retry prompt on it (same contract as F3 import).
+    """
+    store.require_library_root()
+    pack_path = str(pack_path)
+    try:
+        z = zipfile.ZipFile(pack_path)
+    except (OSError, zipfile.BadZipFile) as e:
+        return {"ok": False, "errors": ["Cannot open package: %s" % e],
+                "manifest": {}, "items": []}
+    with z:
+        try:
+            manifest = _load_manifest(z)
+        except ValueError as e:
+            return {"ok": False, "errors": [str(e)], "manifest": {}, "items": []}
+
+        info = {k: manifest.get(k, "") for k in
+                ("name", "description", "author", "created_at",
+                 "engine_version", "format_version")}
+        info["entries"] = len(manifest.get("entries", []))
+        errors = []
+
+        prefix = manifest.get("lib_prefix", "")
+        if prefix != config.LIB_PREFIX:
+            errors.append(
+                "This package was built for stable path prefix %s but this "
+                "library uses %s - the paths are incompatible"
+                % (prefix or "<unknown>", config.LIB_PREFIX))
+        if (current_engine and not force_version
+                and _version_tuple(manifest.get("engine_version"))
+                > _version_tuple(current_engine)):
+            errors.append(
+                "This package was saved by UE %s but this editor is %s; a "
+                "newer-engine asset cannot be loaded (enable force to override)"
+                % (manifest.get("engine_version"), current_engine))
+        if errors:
+            return {"ok": False, "errors": errors, "manifest": info, "items": []}
+
+        names = set(z.namelist())
+        items, seen = [], set()
+        entries = manifest.get("entries", [])
+        for idx, entry in enumerate(entries, 1):
+            if progress is not None:
+                progress(idx, len(entries), str(entry.get("package", ""))
+                         if isinstance(entry, dict) else "")
+            if not isinstance(entry, dict):
+                errors.append("Malformed manifest entry: %r" % (entry,))
+                continue
+            pkg = str(entry.get("package", ""))
+            if pkg in seen:
+                # A duplicate would archive-then-clobber itself on commit.
+                errors.append("Duplicate entry in manifest: %s" % pkg)
+                continue
+            seen.add(pkg)
+            try:
+                rel = _safe_rel(pkg)
+            except ValueError:
+                errors.append("Package entry outside %s or with an unsafe "
+                              "path: %s" % (config.LIB_PREFIX, pkg))
+                continue
+            for arc in (_tree_name(rel), _meta_name(rel)):
+                if arc not in names:
+                    errors.append("Package is incomplete: %s is missing" % arc)
+            meta = store.load_meta(pkg)
+            # Newer-Kura entry on THIS side: the manifest check above only
+            # covers the schema the package itself carries (SPEC 5.6).
+            local_schema_error = (store.meta_schema_error(meta)
+                                  if meta is not None else None)
+            if local_schema_error:
+                errors.append(local_schema_error)
+                continue
+            if meta is None:
+                status, referrers = "new", []
+            elif meta["sha256"] == entry.get("sha256"):
+                status, referrers = "same", []
+            else:
+                status, referrers = "conflict", library.referrers_of(pkg)
+            items.append({
+                "package": pkg,
+                "class": entry.get("class", ""),
+                "status": status,
+                "size": entry.get("size", 0),
+                "sha256": entry.get("sha256", ""),
+                "referrers": referrers,
+            })
+        if errors:
+            return {"ok": False, "errors": errors, "manifest": info, "items": []}
+        return {"ok": True, "errors": [], "manifest": info, "items": items}
+
+
+def _cleanup_staged(staged):
+    """Best-effort removal of leftover staging copies (+ now-empty dirs)."""
+    for _item, files in staged:
+        for tmp, _final in files:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            d = os.path.dirname(tmp)
+            store._prune_empty_dirs(d, config.TREE_DIR)
+            store._prune_empty_dirs(d, config.META_DIR)
+
+
+def _stage_meta(z, arc, tmp):
+    """Write an incoming meta into staging with the recipient's own filing
+    reset (SPEC F7 import step 5).
+
+    A package ships assets, not somebody else's organisation: collection ids
+    name collections in the EXPORTER's Meta/collections.json, which does not
+    travel, so imported entries land in Unsorted (SPEC F8). Everything else
+    rides along untouched - tags, notes and is_root describe the asset."""
+    with z.open(arc) as src:
+        meta = json.loads(src.read().decode("utf-8"))
+    meta["collections"] = []
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def commit(pack_path, decisions=None, current_engine=None, force_version=False,
+           progress=None):
+    """Import a package into the library (F7 import steps 2-3).
+
+    decisions: {package: "update" | "keep"} for every conflict item.
+    "update" archives the current library version first (restorable from
+    Recently Deleted); the package's meta then replaces the old meta wholesale
+    - meta travels as-is, so local tag edits live on in the archived copy.
+    Every staged .uasset is hash-verified against the manifest before anything
+    is placed, so a corrupted download aborts with the library untouched.
+    Returns {"ok", "errors", "added", "updated", "skipped"}.
+    """
+    decisions = dict(decisions or {})
+    p = preview(pack_path, current_engine=current_engine,
+                force_version=force_version)
+    if not p["ok"]:
+        return {"ok": False, "errors": p["errors"],
+                "added": [], "updated": [], "skipped": []}
+
+    conflicts = [i["package"] for i in p["items"] if i["status"] == "conflict"]
+    undecided = [c for c in conflicts
+                 if decisions.get(c) not in ("update", "keep")]
+    if undecided:
+        return {"ok": False, "added": [], "updated": [], "skipped": [],
+                "errors": ["No update/keep decision for conflict(s): %s"
+                           % undecided]}
+
+    skipped, plan = [], []
+    for item in p["items"]:
+        if item["status"] == "same" or decisions.get(item["package"]) == "keep":
+            skipped.append(item["package"])
+        else:
+            plan.append(item)
+
+    # Stage: extract every incoming file next to its destination and verify
+    # its hash, so extraction/verification failure (corrupt zip, disk full)
+    # aborts the whole batch before anything is archived (same discipline as
+    # ingest/import staging).
+    store.ensure_library_dirs()
+    staged = []  # (item, [(tmp, final), ...])
+    try:
+        with zipfile.ZipFile(pack_path) as z:
+            names = set(z.namelist())
+            for idx, item in enumerate(plan, 1):
+                pkg = item["package"]
+                if progress is not None:
+                    progress(idx, len(plan), pkg)
+                rel = _safe_rel(pkg)  # defense in depth; preview validated too
+                files = []
+                meta_arc = _meta_name(rel)
+                for arc, final in ((_tree_name(rel), store.tree_file(pkg)),
+                                   (meta_arc, store.meta_file(pkg)),
+                                   (_thumb_name(rel), store.thumb_file(pkg))):
+                    if arc not in names:
+                        continue  # thumbnails are optional; rest checked in preview
+                    os.makedirs(os.path.dirname(final), exist_ok=True)
+                    tmp = final + ".kura-staging"
+                    if arc == meta_arc:
+                        _stage_meta(z, arc, tmp)
+                    else:
+                        with z.open(arc) as src, open(tmp, "wb") as dst:
+                            shutil.copyfileobj(src, dst, 1 << 20)
+                    files.append((tmp, final))
+                staged.append((item, files))
+                tree_tmp = files[0][0]
+                if store.sha256_of(tree_tmp) != item["sha256"]:
+                    raise OSError(
+                        "%s failed hash verification - the package file is "
+                        "corrupted (re-download it), or the library it was "
+                        "exported from had unverified changes (run Verify "
+                        "Library there and re-export)" % pkg)
+    except (OSError, zipfile.BadZipFile) as e:
+        _cleanup_staged(staged)
+        return {"ok": False, "added": [], "updated": [], "skipped": skipped,
+                "errors": ["Package staging failed - the library was not "
+                           "modified: %s" % e]}
+
+    # Commit: archive the old version of each conflict, then rename the
+    # staged copies into place (same volume, near-atomic).
+    added, updated = [], []
+    archive_batch = None
+    try:
+        for item, files in staged:
+            pkg = item["package"]
+            if item["status"] == "conflict":
+                archive_batch = store.archive([pkg], batch_dir=archive_batch)
+            for tmp, final in files:
+                os.replace(tmp, final)
+            (updated if item["status"] == "conflict" else added).append(pkg)
+    except OSError as e:
+        _cleanup_staged(staged[len(added) + len(updated):])
+        library.rebuild_index()
+        errors = ["Package import interrupted after %d of %d entr%s: %s"
+                  % (len(added) + len(updated), len(staged),
+                     "y" if len(staged) == 1 else "ies", e)]
+        if archive_batch:
+            errors.append("Archived library versions are in: %s" % archive_batch)
+        return {"ok": False, "errors": errors, "added": added,
+                "updated": updated, "skipped": skipped}
+
+    library.rebuild_index()
+    return {"ok": True, "errors": [], "added": added, "updated": updated,
+            "skipped": skipped}
