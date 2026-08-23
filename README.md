@@ -15,11 +15,9 @@ Send assets to your library, browse and organise them with thumbnails, tags and 
 
 ---
 
-<!-- TODO(release): hero screenshot of the library panel — Docs/media/panel.png -->
-<!-- ![The Kura library panel](Docs/media/panel.png) -->
+![The Kura library panel](Docs/media/panel.png)
 
-<!-- TODO(release): overview GIF, 20–30s: open panel → browse tabs → right-click Import → asset appears in the Content Browser -->
-<!-- ![Kura in action](Docs/media/overview.gif) -->
+![Kura in action](Docs/media/overview.gif)
 
 ## 💡 Why Kura
 
@@ -51,11 +49,7 @@ Kura keeps every library asset under a stable path — `/Game/_AssetLib/...` —
 - **Portable data layer** — per-asset JSON + thumbnails on disk; the database is a cache that can always be rebuilt (**⋮ → Library → *Verify Library***).
 - **PBR Material Importer** — point it at a folder of downloaded PBR texture sets; it imports the textures with correct sRGB/compression settings, renames them consistently, and builds a Material Instance per set wired to your master material. It only touches the current project — nothing is sent to the library (**⋮ → *This Project* → *Build Material Instances from Textures***).
 
-<!-- TODO(release): GIF — Send to Kura: multi-select → right-click → upload preview with colour summary and conflict dropdowns → Confirm -->
-<!-- ![Send to Kura](Docs/media/send-to-kura.gif) -->
-
-<!-- TODO(release): GIF — shared masters: import MI_AA then MI_AB, only one M_A ends up in the Content Browser -->
-<!-- ![Shared masters stay unique](Docs/media/master-dedup.gif) -->
+![Send to Kura](Docs/media/send-to-kura.gif)
 
 ## 📥 Installation
 
@@ -93,9 +87,15 @@ Right-click a selection of tiles → **Export as Package**, or a folder in the t
 
 The result is one self-contained file (zip layout, inspectable) carrying assets, metadata, tags and thumbnails. Another Kura user imports it via **⋮ → Library → Import Package**: identical entries are skipped, changed ones prompt — the same identity rules as everything else, so packages can overlap freely and shared masters still deduplicate. Every file is hash-verified on import, so a corrupted download aborts cleanly without touching the library.
 
-<!-- TODO(release): attach the sample pack to the release -->
+A package also carries its collections, keyed by path rather than by id, so importing one files its assets into the same categories they had on the other side instead of dropping them all into *Unsorted*. The import dialog lets you take those collections, put everything into one collection of your own, or skip filing entirely.
 
-Kura ships empty, but every [release](https://github.com/Yashashin/Kura/releases) has a small sample pack attached — a handful of models and materials from [Poly Haven](https://polyhaven.com) and [ambientCG](https://ambientcg.com), both CC0. Import it with **⋮ → Library → Import Package**; it is there to show what a filled library looks like, not to be one. I keep a much larger library of Poly Haven and ambientCG materials for my own work; I may publish a snapshot of it someday — no timeline, no promises.
+<!-- TODO(release): attach Kura_Starter.kurapack to the release -->
+
+### Something to import
+
+Kura ships empty. Every [release](https://github.com/Yashashin/Kura/releases) has **`Kura_Starter.kurapack`** attached — 262 MB, eight surface materials (wood, brick, stone, concrete, metal, fabric, leather, ground) plus the master material, material functions and textures behind them. Import it with **⋮ → Library → Import Package** to walk the flow once and see a filled library: nine tiles, a collection tree, source tags to filter by, and the shared material functions listed under **Shared Dependencies**.
+
+Beyond that, my own material library is published in full: **[2,680 CC0 materials across 33 packs](Docs/packs.md)**, from [Poly Haven](https://polyhaven.com) and [ambientCG](https://ambientcg.com), free to download and pick from. Import the starter pack first and every pack after it will skip the two dozen-odd assets they all share — deduplication doing its job in front of you. Those packs are a snapshot, published as-is and not maintained; the plugin is the thing I support.
 
 ## 🛠️ Configuration
 
@@ -151,7 +151,7 @@ Kura writes into your *project* when you ask it to — **Import**, **Create _Ass
 ## 🎮 Engine versions & library format
 
 - **Supported engines: UE 5.7 and 5.8.** The policy is the current engine plus the previous one. Each release ships one zip per engine version — plugin binaries are never interchangeable between engine versions.
-- **Assets only travel upward.** The sample pack is built with UE 5.7, so it imports into 5.7 and 5.8 alike. That direction is an engine rule rather than a Kura one: a `.uasset` records the version that saved it, an older engine refuses to load a newer one, and Unreal has no "save as an older version". Kura's version guard catches this at import time and tells you why, instead of leaving you with an editor that fails to open the file.
+- **Assets only travel upward.** The starter pack and the asset packs are built with UE 5.7, so they import into 5.7 and 5.8 alike. That direction is an engine rule rather than a Kura one: a `.uasset` records the version that saved it, an older engine refuses to load a newer one, and Unreal has no "save as an older version". Kura's version guard catches this at import time and tells you why, instead of leaving you with an editor that fails to open the file.
 - **Working across both versions?** The engine that uploads an asset sets that asset's floor — send it from 5.8 and only 5.8 can import it back, send it from 5.7 and either engine can. A mixed library is fine: the guard is per asset, and an import is blocked only when something in its dependency closure is too new. The simple rule is to upload from the older engine.
 - **Library format:** each asset's metadata carries a `schema_version` (currently 2). New fields always arrive with a default and existing ones are never renamed or repurposed, so a newer Kura reads an older library as it is and upgrades entries one at a time as it rewrites them — never a bulk rewrite of a library it did not create. A `.kurapack` built by a newer Kura than yours is refused on import, with a message telling you to update. The same holds for a whole library: if you open one written by a newer Kura, it stays readable — browse it, import from it — but any change to it is refused rather than risk dropping fields this build does not know about. *Verify Library* lists the entries this applies to.
 
