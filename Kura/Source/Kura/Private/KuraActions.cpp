@@ -110,6 +110,7 @@ namespace
 			Item->TryGetStringField(TEXT("package"), RowData->Package);
 			Item->TryGetStringField(TEXT("class"), RowData->Class);
 			Item->TryGetStringField(TEXT("status"), RowData->Status);
+			Item->TryGetBoolField(TEXT("selected"), RowData->bSelected);
 			const TArray<TSharedPtr<FJsonValue>>* Refs = nullptr;
 			if (Item->TryGetArrayField(TEXT("referrers"), Refs))
 			{
@@ -157,6 +158,44 @@ namespace
 			.Text(FText::Format(LOCTEXT("CountSeg", "{0} {1}"), FText::AsNumber(Count), Noun))
 			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 			.ColorAndOpacity(Count > 0 ? FSlateColor(Color) : FSlateColor::UseSubduedForeground());
+	}
+
+	/** The asset cell of a preview row: name first, then class and folder
+	 *  trailing it, dimmed. Name-first because a package path is long and the
+	 *  dialog is not wide - trailing the path lets it ellipsize where that
+	 *  costs nothing, and keeps the names in one readable column instead of
+	 *  wrapping every row onto two lines.
+	 *  bBold marks an asset the user picked: in a batch whose closure runs to
+	 *  hundreds of entries, the handful actually selected have to stand out. */
+	TSharedRef<SWidget> MakePreviewLabel(const FString& Package, const FString& Class,
+		bool bBold)
+	{
+		FString Folder, Leaf;
+		if (!Package.Split(TEXT("/"), &Folder, &Leaf, ESearchCase::CaseSensitive,
+			ESearchDir::FromEnd))
+		{
+			Leaf = Package;
+		}
+		FString Trailing = Class;
+		if (!Folder.IsEmpty())
+		{
+			Trailing += TEXT("   ") + Folder;
+		}
+		return SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(Leaf))
+				.Font(FCoreStyle::GetDefaultFontStyle(bBold ? "Bold" : "Regular", 9))
+			]
+			+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+			.Padding(8.f, 0.f, 0.f, 0.f)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(Trailing))
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
+			];
 	}
 
 	/** One entry of the collection list, flattened for menus and combo boxes
@@ -240,9 +279,46 @@ namespace
 			];
 	}
 
+	/** Wire value meaning "file these the way the package itself had them"
+	 *  (SPEC F7 import step 5). Must match kura.pack.PACK_COLLECTIONS. Not a
+	 *  collection id (those are "c_" + 8 hex), so one field carries both. */
+	const TCHAR* const KuraPackCollections = TEXT("__package__");
+
+	/** Optional "Collection" picker for ShowPreviewDialog. */
+	struct FKuraCollectionPicker
+	{
+		/** Receives the chosen wire value: "" (Unsorted), a collection id, or
+		 *  KuraPackCollections. Invalid = no picker at all. */
+		TSharedPtr<FString> Selected;
+		/** When set, a leading option mapping to KuraPackCollections, which
+		 *  also becomes the default. Left empty for a package that carries no
+		 *  filing, so the list is then exactly what ingest shows. */
+		FText PackOptionLabel;
+		/** Overrides the picker tooltip; empty keeps the ingest wording. */
+		FText ToolTip;
+	};
+
+	/** Which status groups the preview list shows. Deliberately not
+	 *  persisted: this is "what do I want to look at in this batch", not a
+	 *  preference, and a remembered filter would open the next dialog on a
+	 *  list the user cannot predict. */
+	struct FKuraStatusFilter
+	{
+		bool bNew = true;
+		bool bSame = true;
+		bool bConflict = true;
+	};
+
+	/** The flag for one status, by reference so a chip can read and write it. */
+	bool& FilterFlagFor(FKuraStatusFilter& Filter, const FString& Status)
+	{
+		if (Status == TEXT("new")) { return Filter.bNew; }
+		return Status == TEXT("same") ? Filter.bSame : Filter.bConflict;
+	}
+
 	/** Preview list + per-conflict decisions; OnConfirm gets {package: decision}.
 	 *  DecisionOptions carry a stable wire key + a Title-Case label. When
-	 *  DepsAsRootsFlag / BatchTags / CollectionId are valid, the ingest-only
+	 *  DepsAsRootsFlag / BatchTags / Picker.Selected are valid, the
 	 *  "Mark dependencies as roots" checkbox, "Add Tags" field and "Collection"
 	 *  picker are shown; the caller reads them in OnConfirm. */
 	void ShowPreviewDialog(const FText& Title, const FText& Warning,
@@ -250,10 +326,11 @@ namespace
 		const TArray<FKuraDecisionOption>& DecisionOptions,
 		TSharedPtr<bool> DepsAsRootsFlag,
 		TSharedPtr<FString> BatchTags,
-		TSharedPtr<FString> CollectionId,
+		const FKuraCollectionPicker& Picker,
 		TSharedPtr<const SWidget> ModalParent,
 		TFunction<void(const TMap<FString, FString>&)> OnConfirm)
 	{
+		TSharedPtr<FString> CollectionId = Picker.Selected;
 		TSharedRef<TArray<TSharedPtr<FString>>> Options = MakeShared<TArray<TSharedPtr<FString>>>();
 		for (const FKuraDecisionOption& Opt : DecisionOptions)
 		{
@@ -271,13 +348,26 @@ namespace
 		};
 		TSharedRef<TArray<TSharedPtr<FKuraPreviewRow>>> Held = MakeShared<TArray<TSharedPtr<FKuraPreviewRow>>>(Rows);
 
-		int32 NumNew = 0, NumSame = 0, NumConflict = 0;
+		int32 NumNew = 0, NumSame = 0, NumConflict = 0, NumSelected = 0;
 		for (const TSharedPtr<FKuraPreviewRow>& R : Rows)
 		{
 			if (R->Status == TEXT("new")) { ++NumNew; }
 			else if (R->Status == TEXT("same")) { ++NumSame; }
 			else { ++NumConflict; }
+			if (R->bSelected) { ++NumSelected; }
 		}
+		// A .kurapack preview marks no row selected - the user picked the whole
+		// file - so the role summary and the bold names drop out there.
+		const bool bHasRoleAxis = NumSelected > 0;
+
+		// Identical rows start hidden whenever there is anything else to look
+		// at (2026-08-23): they need no decision, and a closure that is mostly
+		// already in the library buries the rows that do. Their count stays in
+		// the header, and a line under the list says how many are hidden.
+		// Not when there are none to hide, though - an unticked box next to a
+		// zero reads as "something is missing" when nothing is.
+		const TSharedRef<FKuraStatusFilter> Filter = MakeShared<FKuraStatusFilter>();
+		Filter->bSame = (NumSame == 0 || NumNew + NumConflict == 0);
 
 		const TSharedRef<SWindow> Window = SNew(SWindow)
 			.Title(Title)
@@ -286,19 +376,32 @@ namespace
 			.SupportsMinimize(false);
 		const TWeakPtr<SWindow> WeakWindow = Window;
 
-		// Conflicts first (stable): in a large batch the rows that need a
-		// decision must not be buried under thousands of new/same rows.
-		Held->StableSort([](const TSharedPtr<FKuraPreviewRow>& A, const TSharedPtr<FKuraPreviewRow>& B)
+		// Decisions first, then what changes, then what does not: in a large
+		// batch the rows that need a decision must not be buried under
+		// thousands of new/same rows. Stable, so each group keeps the package
+		// order Python sorted it into.
+		const auto StatusRank = [](const FString& Status) -> int32
 		{
-			return (A->Status == TEXT("conflict")) > (B->Status == TEXT("conflict"));
+			if (Status == TEXT("conflict")) { return 0; }
+			return Status == TEXT("new") ? 1 : 2;
+		};
+		Held->StableSort([StatusRank](const TSharedPtr<FKuraPreviewRow>& A, const TSharedPtr<FKuraPreviewRow>& B)
+		{
+			return StatusRank(A->Status) < StatusRank(B->Status);
 		});
+		// Held stays whole. Confirm reads every conflict's decision off it and
+		// "Set all" writes to every conflict, so a row the filter hides must
+		// still carry its decision into the commit - only the list's item
+		// source is filtered.
+		const TSharedRef<TArray<TSharedPtr<FKuraPreviewRow>>> Visible =
+			MakeShared<TArray<TSharedPtr<FKuraPreviewRow>>>();
 		// Virtualized list: a full-site .kurapack (F7) previews thousands of
 		// entries; a widget-per-row SVerticalBox would hang the dialog.
 		const TSharedRef<SListView<TSharedPtr<FKuraPreviewRow>>> List =
 			SNew(SListView<TSharedPtr<FKuraPreviewRow>>)
-			.ListItemsSource(&Held.Get())
+			.ListItemsSource(&Visible.Get())
 			.SelectionMode(ESelectionMode::None)
-			.OnGenerateRow_Lambda([Options, LabelForKey](TSharedPtr<FKuraPreviewRow> R,
+			.OnGenerateRow_Lambda([Options, LabelForKey, bHasRoleAxis](TSharedPtr<FKuraPreviewRow> R,
 				const TSharedRef<STableViewBase>& OwnerTable) -> TSharedRef<ITableRow>
 		{
 			TSharedRef<SHorizontalBox> RowBox = SNew(SHorizontalBox)
@@ -314,9 +417,7 @@ namespace
 			]
 			+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
 			[
-				SNew(STextBlock)
-				.Text(FText::FromString(R->Package + TEXT("  (") + R->Class + TEXT(")")))
-				.AutoWrapText(true)
+				MakePreviewLabel(R->Package, R->Class, bHasRoleAxis && R->bSelected)
 			];
 			if (R->Status == TEXT("conflict"))
 			{
@@ -364,6 +465,51 @@ namespace
 			}
 			return SNew(STableRow<TSharedPtr<FKuraPreviewRow>>, OwnerTable) [ Cell ];
 		});
+
+		// Rebuilds the list's item source from Held. Weak on the list itself:
+		// the chips hold this function, and the list holds the chips' window.
+		const TWeakPtr<SListView<TSharedPtr<FKuraPreviewRow>>> WeakList = List;
+		const TSharedRef<TFunction<void()>> ApplyFilter = MakeShared<TFunction<void()>>(
+			[Held, Visible, Filter, WeakList]()
+			{
+				Visible->Reset();
+				for (const TSharedPtr<FKuraPreviewRow>& R : *Held)
+				{
+					if (FilterFlagFor(*Filter, R->Status))
+					{
+						Visible->Add(R);
+					}
+				}
+				if (const TSharedPtr<SListView<TSharedPtr<FKuraPreviewRow>>> L = WeakList.Pin())
+				{
+					L->RequestListRefresh();
+				}
+			});
+		(*ApplyFilter)();
+
+		// Header chip: the count, plus a checkbox filtering that status in and
+		// out of the list. Disabled at zero - nothing to show or hide.
+		const auto MakeStatusChip = [Filter, ApplyFilter](int32 Count, const FText& Noun,
+			const FString& Status) -> TSharedRef<SWidget>
+		{
+			return SNew(SCheckBox)
+				.IsEnabled(Count > 0)
+				.IsChecked_Lambda([Filter, Status]()
+				{
+					return FilterFlagFor(*Filter, Status)
+						? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+				})
+				.OnCheckStateChanged_Lambda([Filter, Status, ApplyFilter](ECheckBoxState State)
+				{
+					FilterFlagFor(*Filter, Status) = (State == ECheckBoxState::Checked);
+					(*ApplyFilter)();
+				})
+				.ToolTipText(LOCTEXT("StatusChipTip",
+					"Show or hide these rows. This only changes what the list displays - every asset counted here is part of the operation either way."))
+				[
+					CountSegment(Count, Noun, StatusBadgeColor(Status))
+				];
+		};
 
 		// "Update All" / "Ignore All" - one per option, shown only when there
 		// is more than one conflict to resolve. Sets every conflict's decision;
@@ -418,10 +564,10 @@ namespace
 			];
 		}
 
-		// Optional ingest-only Collection picker (SPEC F8). Deliberately
-		// optional: ingest is capture, filing is curation, and forcing a
-		// choice here would stall every bulk upload. Anything left unfiled
-		// shows up under Unsorted in the panel.
+		// Optional Collection picker (SPEC F8; also import, F7 step 5).
+		// Deliberately optional: ingest is capture, filing is curation, and
+		// forcing a choice here would stall every bulk upload. Anything left
+		// unfiled shows up under Unsorted in the panel.
 		TSharedRef<SWidget> CollectionRow = SNew(SBox);
 		if (CollectionId.IsValid())
 		{
@@ -434,6 +580,14 @@ namespace
 				MakeShared<TArray<TSharedPtr<FString>>>();
 			TSharedRef<TMap<FString, FString>> PathToId =
 				MakeShared<TMap<FString, FString>>();
+			// "Use the package's collections" leads, and so becomes the
+			// default, whenever the package brought filing with it.
+			if (!Picker.PackOptionLabel.IsEmpty())
+			{
+				const FString PackLabel = Picker.PackOptionLabel.ToString();
+				CollectionOptions->Add(MakeShared<FString>(PackLabel));
+				PathToId->Add(PackLabel, KuraPackCollections);
+			}
 			const FString NoneLabel = LOCTEXT("CollectionNone", "None (Unsorted)").ToString();
 			CollectionOptions->Add(MakeShared<FString>(NoneLabel));
 			PathToId->Add(NoneLabel, FString());
@@ -462,8 +616,10 @@ namespace
 				SNew(SSearchableComboBox)
 				.OptionsSource(&CollectionOptions.Get())
 				.InitiallySelectedItem(Initial)
-				.ToolTipText(LOCTEXT("BatchCollectionTip",
-					"File the assets you selected under this collection. Auto-collected dependencies are never filed - a shared master belongs to everything that uses it."))
+				.ToolTipText(Picker.ToolTip.IsEmpty()
+					? LOCTEXT("BatchCollectionTip",
+						"File the assets you selected under this collection. Auto-collected dependencies are never filed - a shared master belongs to everything that uses it.")
+					: Picker.ToolTip)
 				// CollectionOptions is captured to keep the array the combo box points
 				// at alive for as long as the widget is.
 				.OnGenerateWidget_Lambda([CollectionOptions](TSharedPtr<FString> Item)
@@ -515,27 +671,57 @@ namespace
 			.Padding(10.f)
 			[
 				SNew(SVerticalBox)
-				+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 6.f)
+				+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 2.f)
 				[
 					SNew(SHorizontalBox)
 					+ SHorizontalBox::Slot().AutoWidth().Padding(0.f, 0.f, 18.f, 0.f)
 					[
-						CountSegment(NumNew, LOCTEXT("NounNew", "New"), StatusBadgeColor(TEXT("new")))
+						MakeStatusChip(NumNew, LOCTEXT("NounNew", "New"), TEXT("new"))
 					]
 					+ SHorizontalBox::Slot().AutoWidth().Padding(0.f, 0.f, 18.f, 0.f)
 					[
-						CountSegment(NumSame, LOCTEXT("NounSame", "Identical (Skipped)"), StatusBadgeColor(TEXT("same")))
+						MakeStatusChip(NumSame, LOCTEXT("NounSame", "Identical (Skipped)"), TEXT("same"))
 					]
 					+ SHorizontalBox::Slot().AutoWidth()
 					[
-						CountSegment(NumConflict,
+						MakeStatusChip(NumConflict,
 							FText::Format(LOCTEXT("NounConflict", "{0}|plural(one=Conflict,other=Conflicts)"), NumConflict),
-							StatusBadgeColor(TEXT("conflict")))
+							TEXT("conflict"))
 					]
+				]
+				// The one line that answers "why is this list so long".
+				+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 6.f)
+				[
+					SNew(STextBlock)
+					.Visibility(bHasRoleAxis ? EVisibility::Visible : EVisibility::Collapsed)
+					.Text(FText::Format(LOCTEXT("RoleSummary",
+						"{0} selected, {1} collected as dependencies"),
+						NumSelected, Held->Num() - NumSelected))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 				]
 				+ SVerticalBox::Slot().FillHeight(1.f)
 				[
 					List
+				]
+				// Receipt for the filters above, so a shortened list never
+				// reads as "some of my assets went missing".
+				+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 4.f, 0.f, 0.f)
+				[
+					SNew(STextBlock)
+					.Visibility_Lambda([Held, Visible]()
+					{
+						return Visible->Num() < Held->Num()
+							? EVisibility::Visible : EVisibility::Collapsed;
+					})
+					.Text_Lambda([Held, Visible]()
+					{
+						return FText::Format(LOCTEXT("HiddenRows",
+							"The filters hide {0} of {1} rows; the hidden rows are still part of this operation."),
+							Held->Num() - Visible->Num(), Held->Num());
+					})
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 				]
 				+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 6.f, 0.f, 0.f)
 				.HAlign(HAlign_Left)
@@ -1165,7 +1351,7 @@ void KuraActions::RunIngestFlow(TSharedPtr<const SWidget> ModalParent)
 		  { TEXT("keep"), LOCTEXT("DecIgnore", "Ignore") } },
 		DepsAsRoots,
 		BatchTags,
-		CollectionId,
+		FKuraCollectionPicker{ CollectionId },
 		ModalParent,
 		[ModalParent, Roots, DepsAsRoots, BatchTags, CollectionId](const TMap<FString, FString>& Decisions)
 		{
@@ -1245,7 +1431,7 @@ void KuraActions::RunImportFlow(const TArray<FString>& Packages,
 		  { TEXT("keep"), LOCTEXT("DecIgnore", "Ignore") } },
 		/*DepsAsRootsFlag*/ nullptr,
 		/*BatchTags*/ nullptr,
-		/*CollectionId*/ nullptr,
+		/*Picker*/ {},
 		ModalParent,
 		[ModalParent, PkgArg, Force](const TMap<FString, FString>& Decisions)
 		{
@@ -1494,6 +1680,55 @@ void KuraActions::RunCreateFoldersFlow(TSharedPtr<const SWidget> ModalParent)
 	Notify(true, NumCreated > 0
 		? LOCTEXT("FoldersCreated", "Kura: created /Game/_AssetLib in this project")
 		: LOCTEXT("FoldersExist", "Kura: /Game/_AssetLib already exists in this project"));
+}
+
+bool KuraActions::RunCreateLibraryFlow(const FString& InRoot,
+	TSharedPtr<const SWidget> ModalParent)
+{
+	const FText Title = LOCTEXT("CreateLibTitle", "Kura - Library Not Created");
+	const FString Root = InRoot.TrimStartAndEnd();
+	if (Root.IsEmpty())
+	{
+		ShowErrorsDialog(Title, { LOCTEXT("CreateLibNoRoot",
+			"Choose a folder for the library first.").ToString() }, ModalParent);
+		return false;
+	}
+	// A relative path resolves against the editor's working directory, which
+	// is the engine's Binaries folder - a library scattered under Program
+	// Files is not what anyone typing "Kura Library" meant.
+	if (FPaths::IsRelative(Root))
+	{
+		ShowErrorsDialog(Title, { FString::Printf(TEXT(
+			"\"%s\" is not a full path. Give a drive and folder - for example "
+			"C:\\Users\\you\\Documents\\Kura Library - or pick one with the "
+			"folder button."), *Root) }, ModalParent);
+		return false;
+	}
+	if (!KuraLibrary::SaveConfig({ { TEXT("library_root"), Root } }, {}))
+	{
+		ShowErrorsDialog(Title, { FString::Printf(TEXT(
+			"Could not write the settings file %s."),
+			*KuraLibrary::GetConfigFilePath()) }, ModalParent);
+		return false;
+	}
+	const TSharedPtr<FJsonObject> Result = KuraPython::Call(TEXT("init_library()"));
+	bool bOk = false;
+	if (Result.IsValid())
+	{
+		Result->TryGetBoolField(TEXT("ok"), bOk);
+	}
+	if (!bOk)
+	{
+		// The config now points at a root that could not be created. That is
+		// on purpose: the panel's missing-root state shows the path and offers
+		// this flow again, so the failed attempt is visible and fixable rather
+		// than forgotten.
+		ShowErrorsDialog(Title, ErrorsFromResult(Result), ModalParent);
+		return false;
+	}
+	Notify(true, LOCTEXT("CreateLibDone", "Kura: library ready"));
+	OnLibraryChanged().Broadcast();
+	return true;
 }
 
 // --- Collections (SPEC F8) -------------------------------------------------
@@ -2018,6 +2253,12 @@ namespace
 		}
 
 		FString PackName = FPaths::GetBaseFilename(PackPath);
+		// How many collections the package brought, and how many of them this
+		// library does not have yet (SPEC F7 import step 5). Zero total = the
+		// package predates the feature or was never filed: the picker then
+		// shows only Unsorted plus this library's own collections, so the
+		// behaviour is exactly what it was before packages carried filing.
+		int32 PackCollections = 0, NewCollections = 0;
 		const TSharedPtr<FJsonObject>* Manifest = nullptr;
 		if (Preview->TryGetObjectField(TEXT("manifest"), Manifest))
 		{
@@ -2026,6 +2267,23 @@ namespace
 			{
 				PackName = ManifestName;
 			}
+			const TSharedPtr<FJsonObject>* Cols = nullptr;
+			if ((*Manifest)->TryGetObjectField(TEXT("collections"), Cols))
+			{
+				(*Cols)->TryGetNumberField(TEXT("total"), PackCollections);
+				(*Cols)->TryGetNumberField(TEXT("new"), NewCollections);
+			}
+		}
+
+		FKuraCollectionPicker Picker;
+		Picker.Selected = MakeShared<FString>();
+		if (PackCollections > 0)
+		{
+			Picker.PackOptionLabel = LOCTEXT("CollectionFromPack",
+				"Use the package's collections");
+			Picker.ToolTip = FText::Format(LOCTEXT("PackCollectionTip",
+				"Where the imported assets get filed. \"Use the package's collections\" rebuilds the {0} {0}|plural(one=collection,other=collections) this package was filed under, reusing yours where the names match and adding the {1} you do not have yet. Pick one of your own collections instead to drop everything into that one, flat. Either way only roots are filed - a shared master belongs to everything that uses it."),
+				PackCollections, NewCollections);
 		}
 
 		const TArray<TSharedPtr<FKuraPreviewRow>> Rows = RowsFromPreview(Preview, TEXT("keep"));
@@ -2039,13 +2297,14 @@ namespace
 			  { TEXT("keep"), LOCTEXT("DecIgnore", "Ignore") } },
 			/*DepsAsRootsFlag*/ nullptr,
 			/*BatchTags*/ nullptr,
-			/*CollectionId*/ nullptr,
+			Picker,
 			ModalParent,
-			[ModalParent, PathArg, Force](const TMap<FString, FString>& Decisions)
+			[ModalParent, PathArg, Force, Chosen = Picker.Selected](const TMap<FString, FString>& Decisions)
 			{
 				const TSharedPtr<FJsonObject> Result = KuraPython::Call(FString::Printf(
-					TEXT("package_commit('%s', '%s', %s)"), *PathArg,
-					*KuraPython::EscapePyStr(KuraPython::ToJsonObject(Decisions)), *Force));
+					TEXT("package_commit('%s', '%s', %s, '%s')"), *PathArg,
+					*KuraPython::EscapePyStr(KuraPython::ToJsonObject(Decisions)), *Force,
+					*KuraPython::EscapePyStr(*Chosen)));
 				bool bCommitOk = false;
 				if (Result.IsValid())
 				{
@@ -2064,11 +2323,40 @@ namespace
 						const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
 						return Result->TryGetArrayField(Field, Arr) ? Arr->Num() : 0;
 					};
+					int32 Filed = 0, Created = 0;
+					FString FilingError;
+					const TSharedPtr<FJsonObject>* Cols = nullptr;
+					if (Result->TryGetObjectField(TEXT("collections"), Cols))
+					{
+						const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+						if ((*Cols)->TryGetArrayField(TEXT("filed"), Arr)) { Filed = Arr->Num(); }
+						if ((*Cols)->TryGetArrayField(TEXT("created"), Arr)) { Created = Arr->Num(); }
+						(*Cols)->TryGetStringField(TEXT("error"), FilingError);
+					}
 					KuraActions::Notify(true, FText::Format(
 						LOCTEXT("PackDone", "Kura: package imported - {0} added, {1} updated, {2} skipped"),
 						FText::AsNumber(Count(TEXT("added"))),
 						FText::AsNumber(Count(TEXT("updated"))),
 						FText::AsNumber(Count(TEXT("skipped")))));
+					if (Filed > 0)
+					{
+						KuraActions::Notify(true, Created > 0
+							? FText::Format(LOCTEXT("PackFiledNew",
+								"Kura: filed {0} {0}|plural(one=asset,other=assets), creating {1} {1}|plural(one=collection,other=collections)"),
+								Filed, Created)
+							: FText::Format(LOCTEXT("PackFiledExisting",
+								"Kura: filed {0} {0}|plural(one=asset,other=assets) into existing collections"),
+								Filed));
+					}
+					if (!FilingError.IsEmpty())
+					{
+						// The assets are in; only the filing tripped, so this
+						// is a warning next to a successful import.
+						KuraActions::Notify(false, FText::Format(
+							LOCTEXT("PackFilingFailed",
+								"Kura: assets imported, but filing them into collections failed - {0}"),
+							FText::FromString(FilingError)));
+					}
 				}
 				KuraActions::OnLibraryChanged().Broadcast();
 			});

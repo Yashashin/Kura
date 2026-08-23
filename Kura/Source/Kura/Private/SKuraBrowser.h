@@ -77,6 +77,12 @@ private:
 	 *  Collections adds the dependencies those roots exclusively own,
 	 *  Folders adds the non-root entries stored in the selected folder. */
 	bool bShowDeps = false;
+	/** Three library states, not two (2026-08-23): never set up (no
+	 *  config.json), set up but the folder is gone, set up and fine. Each gets
+	 *  its own empty-state card - collapsing the first two sent a new user who
+	 *  declined the setup dialog into the "your library is empty" tutorial,
+	 *  which then failed with a message about a folder that never existed. */
+	bool bLibraryConfigured = true;
 	bool bLibraryRootMissing = false; // configured root gone from disk (2e step 2)
 	bool bIncludeSubfolders = true;
 	float TileSize = 150.f;        // config tile_size; slider writes it back
@@ -121,6 +127,9 @@ private:
 	void SetActiveTab(int32 NewTab);
 	void RebuildFolderTree();     // tree source / expansion / selection
 	void RebuildCollectionTree(); // same, for the F8 tree
+	/** Left-column tag filter list, rebuilt from AllEntries. Split out of the
+	 *  disk refresh so a tag edit can update it without one (2026-08-23). */
+	void RebuildTagList();
 	void RebuildQueryRows();      // the pinned Unsorted / Shared rows
 	/** Select a saved query (or clear it), keeping the tree selection - the
 	 *  other half of the same one-selection model - in step. */
@@ -194,9 +203,12 @@ private:
 	FReply OnImportClicked();
 	FReply OnRefreshClicked();
 	void ShowSettingsDialog();
-	/** First-run welcome: pick a folder and create the library skeleton.
-	 *  Shown once (deferred) when no config.json exists yet (SPEC F5). */
-	void ShowFirstRunDialog();
+	/** Pick a folder and create (or adopt) the library there. Opened
+	 *  automatically on first run, and by hand from the two empty-state cards
+	 *  that have no library to show. InitialRoot empty = whatever the config
+	 *  points at; a value is passed when reopening after a rejected path, so
+	 *  the user does not have to retype it (SPEC F5). */
+	void ShowLibrarySetupDialog(const FString& InitialRoot = FString());
 	void SaveTileSize();
 	void CommitTags(const FString& Package, const FString& TagsCsv);
 	void CommitNotes(const FString& Package, const FString& Notes);

@@ -192,10 +192,17 @@ def iter_metas():
     """Yield every per-asset meta dict in the library (Meta mirror walk).
 
     Skips the reserved files the mirror also hosts - collections.json sits at
-    the top of Meta/ but describes the collection tree, not an asset."""
+    the top of Meta/ but describes the collection tree, not an asset. Matched
+    at the top level only: an asset named "collections" further down owns a
+    meta file with exactly that name, and skipping it by name anywhere would
+    drop that entry from the index without a word (2026-08-23)."""
+    top = os.path.normpath(config.META_DIR)
     for dirpath, _dirs, files in os.walk(config.META_DIR):
+        at_top = os.path.normpath(dirpath) == top
         for name in sorted(files):
-            if not name.endswith(".json") or name in config.RESERVED_META_FILES:
+            if not name.endswith(".json"):
+                continue
+            if at_top and name in config.RESERVED_META_FILES:
                 continue
             with open(os.path.join(dirpath, name), encoding="utf-8") as f:
                 yield json.load(f)

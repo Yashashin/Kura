@@ -207,12 +207,18 @@ def analyze(root_packages, deps_as_roots=False):
     second manual upload (SPEC F1 option, 2026-07-14).
 
     Returns {"ok", "errors", "roots", "items"}; items only when ok.
-    Item: {package, class, is_root, status: new|same|conflict, size,
+    Item: {package, class, is_root, selected, status: new|same|conflict, size,
            sha256 (only when this pass computed one - commit() reuses it),
            referrers (library entries affected, conflict only)}.
+
+    selected: the user picked this one in the Content Browser, as opposed to
+    Kura collecting it around them. Separate from is_root because
+    deps_as_roots turns is_root on for the whole closure - the preview dialog
+    needs "what did I actually ask for" and would lose it (2026-08-23).
     """
     store.require_library_root()
     roots = [str(p) for p in root_packages]
+    picked = set(roots)  # membership test per closure entry, not per root
     errors = []
 
     # 1. root type whitelist
@@ -304,7 +310,8 @@ def analyze(root_packages, deps_as_roots=False):
             items.append({
                 "package": pkg,
                 "class": classes[pkg],
-                "is_root": deps_as_roots or pkg in roots,
+                "is_root": deps_as_roots or pkg in picked,
+                "selected": pkg in picked,
                 "status": status,
                 "size": size,
                 "sha256": sha,  # None = not computed here; commit() will
@@ -353,6 +360,7 @@ def commit(root_packages, decisions=None, deps_as_roots=False, add_tags=None,
     # library yet ("keep"/"same" only get their root promotion, which never
     # rewrites a tree file).
     plan = []  # (item, meta)
+    promoted = []  # metas changed without a file write (root promotion)
     for item in a["items"]:
         pkg = item["package"]
         src = package_to_file(pkg)
@@ -365,6 +373,7 @@ def commit(root_packages, decisions=None, deps_as_roots=False, add_tags=None,
                 if meta and not meta.get("is_root"):
                     meta["is_root"] = True
                     store.save_meta(meta)
+                    promoted.append(meta)
             continue
 
         hard, engine = _direct_deps(pkg)
@@ -429,9 +438,16 @@ def commit(root_packages, decisions=None, deps_as_roots=False, add_tags=None,
         return {"ok": False, "errors": errors, "added": added,
                 "updated": updated, "skipped": skipped}
 
-    library.rebuild_index()
+    # Only the rows this batch wrote. A full rebuild_index() here re-read
+    # every meta file in the library and recreated four tables to register one
+    # upload - 1.31 s at 10,833 entries whether the batch held one asset or a
+    # thousand (measured 2026-08-23). An ingest only ever adds or replaces
+    # entries, so nothing can be left stale by updating just these; the full
+    # rebuild stays on the interrupted path above, where what landed is not
+    # known.
+    library.update_entries([meta for _item, meta in plan] + promoted)
 
-    # File the batch (F8). After the index rebuild, so membership lands on
+    # File the batch (F8). After the index update, so membership lands on
     # entries that are already registered. A filing problem must not fail an
     # upload whose files are already safely in the library - report and move on.
     filed = []

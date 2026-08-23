@@ -134,6 +134,29 @@ def list_tree():
     return {"ok": True, "collections": ordered, "unsorted": counts.get("", 0)}
 
 
+def path_of(cid, items=None):
+    """Full display path of a collection - "Surfaces/Wood/Flooring".
+
+    The portable key for a collection (SPEC F7): an id only names a
+    collection inside ONE library's collections.json, a path means the same
+    thing everywhere - the asset tree's "path = identity" rule (SPEC 5.5)
+    applied one layer up. Names cannot contain slashes (_check_name), so
+    splitting a path back into segments is unambiguous.
+
+    Returns "" for an unknown id. `items` lets a caller walking many ids
+    read collections.json once."""
+    if items is None:
+        items = load()["collections"]
+    byid = _by_id(items)
+    parts, seen = [], set()
+    current = str(cid)
+    while current in byid and current not in seen:
+        seen.add(current)  # a hand-edited parent cycle must not hang an export
+        parts.append(byid[current]["name"])
+        current = byid[current]["parent"]
+    return "/".join(reversed(parts))
+
+
 # ---------------------------------------------------------------------------
 # Tree edits
 # ---------------------------------------------------------------------------
@@ -177,6 +200,57 @@ def create(name, parent=""):
                   "order": (siblings[-1]["order"] + 1) if siblings else 0})
     save(doc)
     return {"ok": True, "id": cid, "name": name, "parent": parent}
+
+
+def ensure_paths(paths, dry_run=False):
+    """Find-or-create every collection named by a full path (SPEC F7 import).
+
+    Returns {"ids": {path: id}, "created": [path, ...]}. Reads and writes
+    collections.json ONCE for the whole batch - a package plants a handful of
+    branches at a time, and create() per node would rewrite the file per node.
+
+    Matching is per segment and case-insensitive, the same rule _check_name
+    uses to refuse two siblings with one name: an incoming "Surfaces/Wood"
+    files into the recipient's existing "surfaces/wood" instead of growing a
+    second one beside it. Backslashes are read as separators too, so a
+    hand-edited manifest cannot mint a name that _check_name would later
+    refuse to rename. dry_run reports what WOULD be created and writes
+    nothing - that is what the import dialog counts."""
+    store.require_library_root()
+    doc = load()
+    items = doc["collections"]
+    known = {c["id"] for c in items}
+    # (parent id, lowercased name) -> id, kept in step with `items` below.
+    index = {(c["parent"], c["name"].lower()): c["id"] for c in items}
+    ids, created = {}, []
+
+    for raw in paths:
+        parent, walked = "", []
+        for segment in str(raw).replace("\\", "/").split("/"):
+            name = segment.strip()
+            if not name:
+                continue  # tolerate "a//b" and leading / trailing separators
+            walked.append(name)
+            key = (parent, name.lower())
+            cid = index.get(key)
+            if cid is None:
+                cid = "c_" + uuid.uuid4().hex[:8]
+                while cid in known:
+                    cid = "c_" + uuid.uuid4().hex[:8]
+                known.add(cid)
+                siblings = _children_of(items, parent)
+                items.append({
+                    "id": cid, "name": name, "parent": parent,
+                    "order": (siblings[-1]["order"] + 1) if siblings else 0,
+                })
+                index[key] = cid
+                created.append("/".join(walked))
+            parent = cid
+        if walked:
+            ids[str(raw)] = parent
+    if created and not dry_run:
+        save(doc)
+    return {"ids": ids, "created": created}
 
 
 def rename(cid, name):
@@ -261,22 +335,30 @@ def assign(packages, cid, add=True):
     cid = str(cid)
     if add:
         _require(load()["collections"], cid)
-    changed = []
-    for pkg in dict.fromkeys(str(p) for p in packages):
-        meta = store.load_meta(pkg)
-        if meta is None:
-            raise RuntimeError("Not a library entry: %s" % pkg)
-        current = list(meta.get("collections", []))
-        if add and cid not in current:
-            current.append(cid)
-        elif not add and cid in current:
-            current.remove(cid)
-        else:
-            continue
-        meta["collections"] = current
-        store.save_meta(meta)
-        library.update_entry(meta)
-        changed.append(pkg)
+    changed, touched = [], []
+    try:
+        for pkg in dict.fromkeys(str(p) for p in packages):
+            meta = store.load_meta(pkg)
+            if meta is None:
+                raise RuntimeError("Not a library entry: %s" % pkg)
+            current = list(meta.get("collections", []))
+            if add and cid not in current:
+                current.append(cid)
+            elif not add and cid in current:
+                current.remove(cid)
+            else:
+                continue
+            meta["collections"] = current
+            store.save_meta(meta)
+            touched.append(meta)
+            changed.append(pkg)
+    finally:
+        # One transaction for the batch: filing a package import's 661 roots
+        # one update_entry() at a time spent seconds in sqlite commits
+        # (2026-08-23). In a finally because the metas are already on disk -
+        # an unknown package later in the list must not leave the entries
+        # written before it missing from the index.
+        library.update_entries(touched)
     return {"ok": True, "changed": changed}
 
 

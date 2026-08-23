@@ -19,11 +19,16 @@ _version_tuple = store.version_tuple
 def preview(packages, force_version=False):
     """Resolve the closure and compare each entry with the project (F3 1-3).
 
-    Returns {"ok", "errors", "items"}; item: {package, class, status:
-    new|same|conflict, size, engine_version}.
+    Returns {"ok", "errors", "items"}; item: {package, class, selected,
+    status: new|same|conflict, size, engine_version}.
+
+    selected: the user picked this entry in the panel, as opposed to the
+    closure pulling it in - the preview dialog marks those rows and counts
+    the rest as dependencies (2026-08-23).
     """
     store.require_library_root()
     errors = []
+    picked = {str(p) for p in packages}
     try:
         closure = library.closure(packages)
     except RuntimeError as e:
@@ -58,6 +63,7 @@ def preview(packages, force_version=False):
             items.append({
                 "package": pkg,
                 "class": meta["class"],
+                "selected": pkg in picked,
                 "status": status,
                 "size": meta["size"],
                 "engine_version": meta["engine_version"],

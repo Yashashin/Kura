@@ -89,8 +89,6 @@ The result is one self-contained file (zip layout, inspectable) carrying assets,
 
 A package also carries its collections, keyed by path rather than by id, so importing one files its assets into the same categories they had on the other side instead of dropping them all into *Unsorted*. The import dialog lets you take those collections, put everything into one collection of your own, or skip filing entirely.
 
-<!-- TODO(release): attach Kura_Starter.kurapack to the release -->
-
 ### Something to import
 
 Kura ships empty. Every [release](https://github.com/Yashashin/Kura/releases) has **`Kura_Starter.kurapack`** attached — 262 MB, eight surface materials (wood, brick, stone, concrete, metal, fabric, leather, ground) plus the master material, material functions and textures behind them. Import it with **⋮ → Library → Import Package** to walk the flow once and see a filled library: nine tiles, a collection tree, source tags to filter by, and the shared material functions listed under **Shared Dependencies**.

@@ -47,19 +47,27 @@
 namespace
 {
 	/** Icon button that opens the native folder picker and writes the chosen
-	 *  path back into the given text box (Library Root fields, F5/first-run). */
-	TSharedRef<SWidget> MakeBrowseButton(TSharedRef<SEditableTextBox> RootBox)
+	 *  path back into the given text box (Library Root fields, F5/setup).
+	 *  OnPicked (optional) receives the chosen path: SetText raises no
+	 *  OnTextChanged, so a caller tracking the field's value has no other way
+	 *  to hear about this. */
+	TSharedRef<SWidget> MakeBrowseButton(TSharedRef<SEditableTextBox> RootBox,
+		TFunction<void(const FString&)> OnPicked = nullptr)
 	{
 		return SNew(SButton)
 			.ToolTipText(LOCTEXT("BrowseTip", "Choose the library folder"))
 			.VAlign(VAlign_Center)
-			.OnClicked_Lambda([RootBox]()
+			.OnClicked_Lambda([RootBox, OnPicked]()
 			{
 				FString Picked;
 				if (KuraLibrary::PickDirectory(LOCTEXT("PickRootTitle", "Choose Library Folder").ToString(),
 					RootBox->GetText().ToString(), Picked))
 				{
 					RootBox->SetText(FText::FromString(Picked));
+					if (OnPicked)
+					{
+						OnPicked(Picked);
+					}
 				}
 				return FReply::Handled();
 			})
@@ -137,11 +145,13 @@ void SKuraBrowser::Construct(const FArguments& InArgs)
 	RefreshFromDisk(/*bForceFullReload*/ true);
 
 	// First run (no config.json yet): offer to create the library. Deferred one
-	// tick so the modal doesn't open during widget construction.
+	// tick so the modal doesn't open during widget construction. Declining it
+	// is not a dead end any more - the empty state then offers the same dialog
+	// (2026-08-23).
 	if (!KuraLibrary::IsConfigured())
 	{
 		RegisterActiveTimer(0.f, FWidgetActiveTimerDelegate::CreateLambda(
-			[this](double, float) { ShowFirstRunDialog(); return EActiveTimerReturnType::Stop; }));
+			[this](double, float) { ShowLibrarySetupDialog(); return EActiveTimerReturnType::Stop; }));
 	}
 }
 
@@ -720,11 +730,57 @@ TSharedRef<SWidget> SKuraBrowser::MakeTilesColumn()
 			]
 			+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center).Padding(16.f)
 			[
-				// Brand-new library: walk the user through their first ingest.
+				// No library at all (no config.json). Must come before the
+				// empty-library tutorial: following that one without a library
+				// ends at Send to Kura failing over a folder that was never
+				// created (2026-08-23).
 				SNew(SVerticalBox)
 				.Visibility_Lambda([this]()
 				{
-					return AllEntries.Num() == 0 && !bLibraryRootMissing
+					return AllEntries.Num() == 0 && !bLibraryConfigured
+						? EVisibility::Visible : EVisibility::Collapsed;
+				})
+				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 0.f, 0.f, 12.f)
+				[
+					SNew(SImage)
+					.Image(KuraStyle::Get().GetBrush("Kura.LogoWatermark"))
+					.DesiredSizeOverride(FVector2D(56.f, 56.f))
+				]
+				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 0.f, 0.f, 4.f)
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("NoLibraryTitle", "Kura has no library yet"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				]
+				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 0.f, 0.f, 10.f)
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("NoLibraryBody",
+						"Your library is one folder on disk that every project can reach.\nChoose where it goes and Kura creates it - that is the whole setup."))
+					.Justification(ETextJustify::Center)
+					.AutoWrapText(true)
+					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				]
+				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("NoLibrarySetUp", "Set Up Library..."))
+					.OnClicked_Lambda([this]()
+					{
+						ShowLibrarySetupDialog();
+						return FReply::Handled();
+					})
+				]
+			]
+			+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center).Padding(16.f)
+			[
+				// Library exists but holds nothing: walk the user through their
+				// first ingest, or let them start from a package.
+				SNew(SVerticalBox)
+				.Visibility_Lambda([this]()
+				{
+					return AllEntries.Num() == 0 && bLibraryConfigured && !bLibraryRootMissing
 						? EVisibility::Visible : EVisibility::Collapsed;
 				})
 				// Logo watermark above the guidance, per the design guideline's
@@ -735,35 +791,126 @@ TSharedRef<SWidget> SKuraBrowser::MakeTilesColumn()
 					.Image(KuraStyle::Get().GetBrush("Kura.LogoWatermark"))
 					.DesiredSizeOverride(FVector2D(56.f, 56.f))
 				]
-				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 0.f, 0.f, 4.f)
+				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 0.f, 0.f, 16.f)
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("EmptyLibraryTitle", "Your library is empty - three steps to fill it:"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+					.Text(LOCTEXT("EmptyLibraryTitle", "Your library is empty"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 11))
 				]
-				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0.f, 0.f, 0.f, 10.f)
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("EmptyLibrarySteps",
-						"1.  Create the /Game/_AssetLib folder in your project (button below)\n"
-						"2.  Arrange your assets inside it in the Content Browser - one folder per asset\n"
-						"     and its own textures works well; keep shared masters in one place\n"
-						"3.  Right-click them and choose \"Send to Kura\""))
-					.AutoWrapText(true)
-					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				]
+				// Two ways in, in the order a new user should try them
+				// (2026-08-23). The sample pack leads and says so: it needs no
+				// assets of their own, it is one download and one click, and it
+				// shows what a filled library looks like before they commit to
+				// arranging one. Left-aligned inside a width cap: centring was
+				// tried and reverted (2026-08-23) - a centred numbered list
+				// puts 1. 2. 3. on three different x positions, and the cap is
+				// needed either way or a wide panel stretches each paragraph
+				// into one unreadable line.
 				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
 				[
-					SNew(SButton)
-					.Text(LOCTEXT("EmptyCreateFolders", "Create _AssetLib Folder"))
-					.ToolTipText(LOCTEXT("CreateFoldersTip",
-						"Create the /Game/_AssetLib folder in the current project. Arrange your assets inside it however you like, then use Send to Kura."))
-					.OnClicked_Lambda([this]()
-					{
-						KuraActions::RunCreateFoldersFlow(AsShared());
-						return FReply::Handled();
-					})
+					SNew(SBox).MaxDesiredWidth(460.f)
+					[
+						SNew(SVerticalBox)
+						+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 4.f)
+						[
+							// One heading line, with the recommendation on it
+							// rather than stacked above: a badge on its own row
+							// reads as a section label, which this is not.
+							SNew(SHorizontalBox)
+							+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Bottom)
+							[
+								SNew(STextBlock)
+								.Text(LOCTEXT("EmptyStarterTitle", "Start with the sample pack"))
+								.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+							]
+							+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Bottom)
+							.Padding(5.f, 0.f, 0.f, 1.f)
+							[
+								SNew(STextBlock)
+								.Text(LOCTEXT("EmptyRecommended", "(RECOMMENDED)"))
+								.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+								.ColorAndOpacity(KuraStyle::Success().Text)
+							]
+						]
+						+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 8.f)
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("EmptyStarterBody",
+								"Every Kura release comes with Kura_Starter.kurapack. Download it from the project page, then import it here."))
+							.AutoWrapText(true)
+							.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+						]
+						+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Left)
+						[
+							SNew(SButton)
+							.Text(LOCTEXT("EmptyImportPackage", "Import Package..."))
+							.ToolTipText(LOCTEXT("EmptyImportPackageTip",
+								"Pick a .kurapack file and import it into the library. Also in the panel menu, under Library."))
+							.OnClicked_Lambda([this]()
+							{
+								KuraActions::RunImportPackageFlow(AsShared());
+								return FReply::Handled();
+							})
+						]
+						+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 18.f, 0.f, 14.f)
+						[
+							SNew(SSeparator).Thickness(1.f)
+						]
+						+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 6.f)
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("EmptyOwnTitle", "Or send in assets of your own"))
+							.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+						]
+						+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 8.f)
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("EmptyLibrarySteps",
+								// The gap after the number lines a wrapped step
+								// up under its own first word.
+								"1.   Create the /Game/_AssetLib folder in this project.\n"
+								"2.   Move the assets you want to send into /Game/_AssetLib.\n"
+								"3.   Select them, right-click, and choose \"Send to Kura\"."))
+							.AutoWrapText(true)
+							.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+						]
+						// The one rule a new user cannot afford to miss, in the
+						// warning colour because missing it is the only thing
+						// that makes Send to Kura refuse a selection outright
+						// (2026-08-23). Two sentences, no icon and nothing after
+						// it: an aside about folder layout underneath only
+						// competed with it, and layout is advice, not a rule.
+						// Not a filled banner either - SBorder tinting needs a
+						// solid brush, and that combination already failed to
+						// render once in this file (the tile placeholder uses
+						// SColorBlock for the same reason); the token's text
+						// layer is meant for exactly this.
+						+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 10.f)
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("EmptyAssetLibRule",
+								"Everything Kura works with lives under /Game/_AssetLib. Kura refuses anything kept somewhere else."))
+							.AutoWrapText(true)
+							.ColorAndOpacity(KuraStyle::Warning().Text)
+						]
+						+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Left)
+						[
+							SNew(SButton)
+							// Longer than the same action's label in the panel
+							// menu on purpose: there it sits under a "This
+							// Project" heading, here it is the first thing a
+							// new user will click and has to say what appears
+							// and where.
+							.Text(LOCTEXT("EmptyCreateFolders", "Create _AssetLib/ in Content Browser"))
+							.ToolTipText(LOCTEXT("CreateFoldersTip",
+								"Create the /Game/_AssetLib folder in the current project. Arrange your assets inside it however you like, then use Send to Kura."))
+							.OnClicked_Lambda([this]()
+							{
+								KuraActions::RunCreateFoldersFlow(AsShared());
+								return FReply::Handled();
+							})
+						]
+					]
 				]
 			]
 			+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center).Padding(16.f)
@@ -790,7 +937,7 @@ TSharedRef<SWidget> SKuraBrowser::MakeTilesColumn()
 					.Text_Lambda([]()
 					{
 						return FText::Format(LOCTEXT("RootMissingBody",
-							"Kura is configured to use {0}, but that folder does not exist - it may have been moved, renamed, or be on a disconnected drive. If you moved the library, point Settings at its new location. Nothing is created or changed until then."),
+							"Kura is configured to use {0}, but that folder does not exist - it may have been moved, renamed, or be on a disconnected drive. If you moved the library, point Settings at its new location; if it is gone for good, set up a new one. Nothing is created or changed until then."),
 							FText::FromString(KuraLibrary::GetLibraryRoot()));
 					})
 					.Justification(ETextJustify::Center)
@@ -799,13 +946,32 @@ TSharedRef<SWidget> SKuraBrowser::MakeTilesColumn()
 				]
 				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
 				[
-					SNew(SButton)
-					.Text(LOCTEXT("RootMissingSettings", "Open Settings"))
-					.OnClicked_Lambda([this]()
-					{
-						ShowSettingsDialog();
-						return FReply::Handled();
-					})
+					SNew(SHorizontalBox)
+					// Settings only re-points the config; it never creates
+					// anything, so a library that is gone for good left no way
+					// forward from this card at all (2026-08-23).
+					+ SHorizontalBox::Slot().AutoWidth().Padding(0.f, 0.f, 6.f, 0.f)
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("RootMissingSetUp", "Set Up Library..."))
+						.ToolTipText(LOCTEXT("RootMissingSetUpTip",
+							"Choose a folder and create the library there - or point Kura at an existing library to pick it up as it is."))
+						.OnClicked_Lambda([this]()
+						{
+							ShowLibrarySetupDialog();
+							return FReply::Handled();
+						})
+					]
+					+ SHorizontalBox::Slot().AutoWidth()
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("RootMissingSettings", "Open Settings"))
+						.OnClicked_Lambda([this]()
+						{
+							ShowSettingsDialog();
+							return FReply::Handled();
+						})
+					]
 				]
 			]
 		]
@@ -1173,7 +1339,8 @@ void SKuraBrowser::RefreshFromDisk(bool bForceFullReload)
 	// drive) must show the missing-root notice, not the empty-library
 	// tutorial - following the tutorial would rebuild a fresh library at the
 	// stale path. Cached here so the empty-state lambdas don't stat per frame.
-	bLibraryRootMissing = KuraLibrary::IsConfigured()
+	bLibraryConfigured = KuraLibrary::IsConfigured();
+	bLibraryRootMissing = bLibraryConfigured
 		&& !IFileManager::Get().DirectoryExists(*KuraLibrary::GetLibraryRoot());
 
 	// Carrying the previous entries in lets unchanged meta files be reused
@@ -1192,7 +1359,7 @@ void SKuraBrowser::RefreshFromDisk(bool bForceFullReload)
 	// check itself happens on a worker thread.
 	KuraThumbs::Revalidate();
 
-	FolderRoots = KuraLibrary::LoadFolderTree();
+	FolderRoots = KuraLibrary::LoadFolderTree(AllEntries);
 	// The loader returns the saved queries as trailing roots; they live in
 	// their own pinned strip below the tree from here on.
 	CollectionRoots = KuraLibrary::LoadCollectionTree(AllEntries);
@@ -1206,6 +1373,14 @@ void SKuraBrowser::RefreshFromDisk(bool bForceFullReload)
 		}
 	}
 
+	RebuildTagList();
+	RebuildFolderTree();
+	RebuildCollectionTree();
+	ApplyFilter();
+}
+
+void SKuraBrowser::RebuildTagList()
+{
 	TSet<FString> TagSet;
 	for (const TSharedPtr<FKuraEntry>& E : AllEntries)
 	{
@@ -1221,15 +1396,13 @@ void SKuraBrowser::RefreshFromDisk(bool bForceFullReload)
 	{
 		AllTags.Add(MakeShared<FString>(T));
 	}
+	// A tag that no entry carries any more cannot stay an active filter.
 	ActiveTags = ActiveTags.Intersect(TagSet);
 
 	if (TagListView.IsValid())
 	{
 		TagListView->RequestListRefresh();
 	}
-	RebuildFolderTree();
-	RebuildCollectionTree();
-	ApplyFilter();
 }
 
 void SKuraBrowser::RebuildFolderTree()
@@ -2588,14 +2761,39 @@ void SKuraBrowser::SaveTileSize()
 	}
 }
 
-void SKuraBrowser::ShowFirstRunDialog()
+void SKuraBrowser::ShowLibrarySetupDialog(const FString& InitialRoot)
 {
+	// Opens on whatever the config already points at, so the missing-root card
+	// lands on the path that went missing rather than on the default. An
+	// explicit InitialRoot wins: that is how a rejected path comes back with
+	// the text still in the box instead of making the user retype it.
+	const bool bConfigured = KuraLibrary::IsConfigured();
+	const FString StartRoot = !InitialRoot.IsEmpty()
+		? InitialRoot
+		: (bConfigured ? KuraLibrary::GetLibraryRoot()
+			: KuraLibrary::GetDefaultLibraryRoot());
+
+	// Create or adopt is the difference between an empty folder and someone
+	// else's library (a reinstall, a second machine, a share), and the button
+	// has to say which one is about to happen - "Create Library" over an
+	// existing library reads as "and empty it". Cached rather than stat-ed per
+	// frame, and refreshed from both ways the field can change, because
+	// SetText raises no OnTextChanged.
+	const TSharedRef<bool> bRootExists = MakeShared<bool>(
+		IFileManager::Get().DirectoryExists(*StartRoot));
 	const TSharedRef<SEditableTextBox> RootBox = SNew(SEditableTextBox)
-		.Text(FText::FromString(KuraLibrary::GetDefaultLibraryRoot()));
+		.Text(FText::FromString(StartRoot))
+		.OnTextChanged_Lambda([bRootExists](const FText& NewText)
+		{
+			*bRootExists = IFileManager::Get().DirectoryExists(
+				*NewText.ToString().TrimStartAndEnd());
+		});
 
 	const TSharedRef<SWindow> Window = SNew(SWindow)
-		.Title(LOCTEXT("FirstRunTitle", "Welcome to Kura"))
-		.ClientSize(FVector2D(560.f, 220.f))
+		.Title(bConfigured
+			? LOCTEXT("LibSetupTitle", "Kura - Set Up Library")
+			: LOCTEXT("FirstRunTitle", "Welcome to Kura"))
+		.ClientSize(FVector2D(560.f, 240.f))
 		.SupportsMaximize(false)
 		.SupportsMinimize(false)
 		.SizingRule(ESizingRule::FixedSize);
@@ -2612,7 +2810,7 @@ void SKuraBrowser::ShowFirstRunDialog()
 				SNew(STextBlock)
 				.AutoWrapText(true)
 				.Text(LOCTEXT("FirstRunBody",
-					"Choose where your asset library lives on disk. Kura will create the folder and an empty index there. You can move it later in Settings."))
+					"Choose where your asset library lives on disk. Kura creates the folder and an empty index there, or picks up a library already sitting in it - that is how you reconnect to one after a reinstall. You can move it later in Settings."))
 			]
 			+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 0.f, 0.f, 6.f)
 			[
@@ -2624,7 +2822,10 @@ void SKuraBrowser::ShowFirstRunDialog()
 				+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center) [ RootBox ]
 				+ SHorizontalBox::Slot().AutoWidth().Padding(4.f, 0.f, 0.f, 0.f)
 				[
-					MakeBrowseButton(RootBox)
+					MakeBrowseButton(RootBox, [bRootExists](const FString& Picked)
+					{
+						*bRootExists = IFileManager::Get().DirectoryExists(*Picked);
+					})
 				]
 			]
 			+ SVerticalBox::Slot().FillHeight(1.f) [ SNew(SBox) ]
@@ -2634,36 +2835,29 @@ void SKuraBrowser::ShowFirstRunDialog()
 				+ SHorizontalBox::Slot().AutoWidth().Padding(0.f, 0.f, 4.f, 0.f)
 				[
 					SNew(SButton)
-					.Text(LOCTEXT("FirstRunCreate", "Create Library"))
+					.Text_Lambda([bRootExists]()
+					{
+						return *bRootExists
+							? LOCTEXT("FirstRunUse", "Use This Folder")
+							: LOCTEXT("FirstRunCreate", "Create Library");
+					})
 					.OnClicked_Lambda([this, WeakWindow, RootBox]()
 					{
 						const FString Root = RootBox->GetText().ToString().TrimStartAndEnd();
-						if (Root.IsEmpty())
+						// Asked to close before the flow runs, so this window
+						// is on its way out while the flow reports; a failure
+						// then reopens it with the same text rather than
+						// making the user retype the path. (Destruction is
+						// deferred, so an error dialog does briefly sit on top
+						// of this one - the same shape ShowTextPrompt uses for
+						// its retry.)
+						if (const TSharedPtr<SWindow> W = WeakWindow.Pin())
 						{
-							KuraActions::Notify(false, LOCTEXT("FirstRunNoRoot", "Kura: choose a library folder first"));
-							return FReply::Handled();
+							W->RequestDestroyWindow();
 						}
-						TMap<FString, FString> Fields;
-						Fields.Add(TEXT("library_root"), Root);
-						bool bOk = KuraLibrary::SaveConfig(Fields, {});
-						if (bOk)
+						if (!KuraActions::RunCreateLibraryFlow(Root, AsShared()))
 						{
-							const TSharedPtr<FJsonObject> Result = KuraPython::Call(TEXT("init_library()"));
-							bool bInit = false;
-							bOk = Result.IsValid() && Result->TryGetBoolField(TEXT("ok"), bInit) && bInit;
-						}
-						KuraActions::Notify(bOk, bOk
-							? LOCTEXT("FirstRunDone", "Kura: library created")
-							: LOCTEXT("FirstRunFail", "Kura: could not create the library"));
-						if (bOk)
-						{
-							if (const TSharedPtr<SWindow> W = WeakWindow.Pin())
-							{
-								W->RequestDestroyWindow();
-							}
-							// A library that did not exist a moment ago has
-							// nothing in common with the previous read.
-							RefreshFromDisk(/*bForceFullReload*/ true);
+							ShowLibrarySetupDialog(Root);
 						}
 						return FReply::Handled();
 					})
@@ -2672,6 +2866,8 @@ void SKuraBrowser::ShowFirstRunDialog()
 				[
 					SNew(SButton)
 					.Text(LOCTEXT("FirstRunLater", "Not Now"))
+					.ToolTipText(LOCTEXT("FirstRunLaterTip",
+						"Leave the library unset. The panel keeps offering this from its empty state - nothing else works until a library exists."))
 					.OnClicked_Lambda([WeakWindow]()
 					{
 						if (const TSharedPtr<SWindow> W = WeakWindow.Pin())
@@ -2994,9 +3190,47 @@ void SKuraBrowser::CommitTags(const FString& Package, const FString& TagsCsv)
 	KuraActions::Notify(bOk, bOk
 		? LOCTEXT("TagsSaved", "Kura: tags saved")
 		: LOCTEXT("TagsFailed", "Kura: saving tags failed"));
-	const FString Keep = Package;
-	RefreshFromDisk();
-	SelectEntryByPackage(Keep);
+	if (!bOk)
+	{
+		return;
+	}
+	// One field on one entry is not worth re-reading the library. The disk
+	// refresh this used to call stats every meta file and every folder under
+	// the library root - a fifth of a second on a warm cache, seconds on a
+	// cold one - and tagging is something the user does in a burst, one Enter
+	// after another (2026-08-23). Python hands back the canonical tag list, so
+	// the entry in memory is brought up to date from that instead.
+	//
+	// MetaStamp is deliberately left as it was: the next real refresh sees the
+	// file's timestamp move, re-reads that one meta and confirms the edit, so
+	// a divergence here cannot outlive the next refresh.
+	if (const TSharedPtr<FKuraEntry>* Found = EntryByPackage.Find(Package))
+	{
+		const TSharedPtr<FKuraEntry>& E = *Found;
+		E->Tags.Reset();
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Result->TryGetArrayField(TEXT("tags"), Arr))
+		{
+			for (const TSharedPtr<FJsonValue>& V : *Arr)
+			{
+				E->Tags.Add(V->AsString());
+			}
+		}
+		E->TagsLower.Reset();
+		E->TagsLower.Reserve(E->Tags.Num());
+		for (const FString& T : E->Tags)
+		{
+			E->TagsLower.Add(T.ToLower());
+		}
+		RebuildTagList();
+	}
+	// Not SelectEntryByPackage: that NAVIGATES to the entry - clears the
+	// collection scope, switches the class tab, turns Show Dependencies on for
+	// a non-root - which made sense only while this refreshed from disk and
+	// had to re-resolve a dangling Selected. Editing a tag must not move the
+	// user somewhere else. A filter pass is still needed: an active tag filter
+	// or a search over tags decides whether this entry still belongs on screen.
+	ApplyFilter();
 }
 
 void SKuraBrowser::CommitNotes(const FString& Package, const FString& Notes)
@@ -3012,10 +3246,17 @@ void SKuraBrowser::CommitNotes(const FString& Package, const FString& Notes)
 	if (!bOk)
 	{
 		KuraActions::Notify(false, LOCTEXT("NotesFailed", "Kura: saving notes failed"));
+		return;
 	}
-	const FString Keep = Package;
-	RefreshFromDisk();
-	SelectEntryByPackage(Keep);
+	// Same reasoning as CommitTags: notes are typed, and re-walking the
+	// library for one field is what made that feel heavy. Search covers notes,
+	// so the lowercase copy has to move with it.
+	if (const TSharedPtr<FKuraEntry>* Found = EntryByPackage.Find(Package))
+	{
+		(*Found)->Notes = Notes;
+		(*Found)->NotesLower = Notes.ToLower();
+	}
+	ApplyFilter(); // search covers notes; see CommitTags for why not Select...
 }
 
 FString SKuraBrowser::FormatSize(int64 Bytes)

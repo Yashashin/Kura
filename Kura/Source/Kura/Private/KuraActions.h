@@ -11,6 +11,10 @@ struct FKuraPreviewRow
 	FString Package;
 	FString Class;
 	FString Status; // new | same | conflict
+	/** The user picked this asset; everything else was collected around it.
+	 *  A .kurapack preview sets it on no row at all - the user picked the
+	 *  whole file - and the dialog then drops the distinction. */
+	bool bSelected = false;
 	TArray<FString> Referrers; // ingest conflicts: affected library referrers
 	TSharedPtr<FString> Decision; // conflicts only; one of the dialog's options
 };
@@ -64,6 +68,13 @@ namespace KuraActions
 	/** F1 onboarding: create /Game/_AssetLib in the CURRENT project (folder
 	 *  only - Kura never moves assets, and the layout below it is yours). */
 	void RunCreateFoldersFlow(TSharedPtr<const SWidget> ModalParent);
+
+	/** F5 setup: point the library at Root and create the skeleton plus an
+	 *  empty index there. Idempotent, so a Root that already holds a library
+	 *  is adopted rather than reset. Returns false and SAYS WHY on failure -
+	 *  this is the one step a brand-new user cannot work around, so the reason
+	 *  must not be swallowed (2026-08-23). Broadcasts on success. */
+	bool RunCreateLibraryFlow(const FString& Root, TSharedPtr<const SWidget> ModalParent);
 
 	/** F8 collections. All of these are pure meta edits - no asset moves, no
 	 *  archiving - so they apply immediately and broadcast OnLibraryChanged.

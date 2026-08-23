@@ -9,10 +9,12 @@ a root plus its exclusive deps per folder, shared assets parked centrally):
 SM_KuraTest -> MI_AA -> M_A -> T_KuraTest ; MI_AB -> M_A (shared master)
 """
 import os
+import shutil
+import tempfile
 
 import unreal
 
-from . import catalog, config, importer, ingest, library, manage, store
+from . import catalog, config, importer, ingest, library, manage, pack, store
 
 TEX = config.LIB_PREFIX + "/Shared/Textures/T_KuraTest"
 MA = config.LIB_PREFIX + "/Shared/Master/M_A"
@@ -36,6 +38,27 @@ def _asset_sub():
 
 def _statuses(result):
     return {i["package"]: i["status"] for i in result["items"]}
+
+
+def _index_snapshot():
+    """Everything library.db holds, as comparable data: assets + tags from
+    search(), the deps table through referrers_of(), the collections table
+    through collection_counts().
+
+    The commit paths stopped rebuilding the whole index per operation
+    (2026-08-23), so a row the incremental update forgets would otherwise only
+    surface much later as a wrong search result."""
+    rows = sorted((r["package"], r["class"], r["is_root"], r["notes"],
+                   tuple(sorted(r["tags"])))
+                  for r in library.search(sort="name"))
+    refs = sorted((r[0], tuple(library.referrers_of(r[0]))) for r in rows)
+    return rows, refs, sorted(library.collection_counts().items())
+
+
+def _selected(result):
+    """The packages a preview says the user picked, as opposed to the ones
+    the closure pulled in (the preview dialog's second axis, 2026-08-23)."""
+    return {i["package"] for i in result["items"] if i.get("selected")}
 
 
 def _reset_library():
@@ -133,6 +156,16 @@ def run_host_test():
     _check(r["ok"], "analyze MI_AA: %s" % r["errors"])
     _check(_statuses(r) == {AA: "new", MA: "new", TEX: "new"},
            "MI_AA preview statuses: %s" % _statuses(r))
+    _check(_selected(r) == {AA},
+           "only the picked asset is selected; the closure rides along: %s"
+           % _selected(r))
+    # deps_as_roots makes every item a root, and must not blur "what did I
+    # pick" - that is what the preview dialog dims the other rows by.
+    ra = ingest.analyze([AA], deps_as_roots=True)
+    _check(all(i["is_root"] for i in ra["items"]),
+           "deps_as_roots must mark the whole closure as roots")
+    _check(_selected(ra) == {AA},
+           "deps_as_roots must not widen selected: %s" % _selected(ra))
     r = ingest.commit([AA])
     _check(r["ok"] and sorted(r["added"]) == sorted([AA, MA, TEX]),
            "MI_AA commit: %s" % r)
@@ -200,12 +233,41 @@ def run_host_test():
            "M_A re-ingest should skip its closure: %s" % r)
     _check(store.load_meta(MA)["is_root"] is True,
            "active ingest must promote M_A to root")
+    incremental = _index_snapshot()
     _check(library.rebuild_index() == 5, "library should have 5 entries")
+    _check(incremental == _index_snapshot(),
+           "the index ingest built incrementally must equal a full rebuild")
 
     _run_collection_checks(furniture)
+    _run_pack_collection_checks()
+    _run_reserved_name_check()
 
     unreal.log_warning("Kura selftest HOST PASS (5 entries, master unique, "
-                       "conflict flow + collections verified)")
+                       "conflict flow + collections + pack filing verified)")
+
+
+def _run_reserved_name_check():
+    """Meta/collections.json is reserved at the TOP of the mirror only
+    (2026-08-23). Skipping it by name anywhere dropped a library asset called
+    "collections" out of the index - and out of the panel - without a word.
+
+    Meta-only fixture: the point is the mirror walk, and a tree file would
+    only add drift for rescan to report."""
+    pkg = config.LIB_PREFIX + "/KuraTest/Chair/collections"
+    meta_path = store.meta_file(pkg)
+    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+    store.save_meta(store.new_meta(pkg, "Texture2D", "0" * 64, 1,
+                                   ingest.engine_version(), "selftest",
+                                   False, [], []))
+    try:
+        # Walks the whole mirror. The reserved file at the top carries no
+        # "package" key, so reaching the assert at all proves it was skipped.
+        packages = {m["package"] for m in store.iter_metas()}
+        _check(pkg in packages,
+               "an asset named 'collections' must still be indexed")
+    finally:
+        os.remove(meta_path)
+        library.rebuild_index()
 
 
 def _run_collection_checks(furniture):
@@ -261,6 +323,81 @@ def _run_collection_checks(furniture):
     _check(catalog.list_tree()["collections"] == [], "tree should be empty again")
 
 
+def _run_pack_collection_checks():
+    """A .kurapack carries its filing by path (SPEC F7 import step 5,
+    2026-08-22). Runs on the library the host test built, with the F8 tree
+    left empty by _run_collection_checks."""
+    surfaces = catalog.create("Surfaces")["id"]
+    wood = catalog.create("Wood", surfaces)["id"]
+    flooring = catalog.create("Flooring", wood)["id"]
+    catalog.create("Metal", surfaces)  # no members: must not travel
+    catalog.assign([SM], flooring)
+    catalog.assign([SM], wood)                       # multi-membership
+    catalog.assign([AB], flooring)
+
+    tmp = tempfile.mkdtemp(prefix="kura_selftest_pack_")
+    try:
+        out = os.path.join(tmp, "filing.kurapack")
+        r = pack.export_package([SM, AB], out, name="Filing")
+        _check(r["ok"], "pack export: %s" % r.get("errors"))
+
+        # Wipe the tree; the entries fall back to Unsorted.
+        catalog.delete(surfaces)
+        _check(catalog.list_tree()["collections"] == [], "tree must be empty")
+        _check(store.load_meta(SM)["collections"] == [], "SM must be unfiled")
+
+        pv = pack.preview(out, current_engine=ingest.engine_version())
+        _check(pv["ok"], "pack preview: %s" % pv.get("errors"))
+        summary = pv["manifest"]["collections"]
+        _check(summary == {"total": 3, "new": 3, "entries": 2},
+               "preview must count the shipped branches: %s" % summary)
+
+        r = pack.commit(out, {}, current_engine=ingest.engine_version(),
+                        collection=pack.PACK_COLLECTIONS)
+        _check(r["ok"], "pack commit: %s" % r.get("errors"))
+        _check(r["collections"]["error"] == "",
+               "filing must not error: %s" % r["collections"]["error"])
+        items = catalog.load()["collections"]
+        paths = sorted(catalog.path_of(c["id"], items) for c in items)
+        _check(paths == ["Surfaces", "Surfaces/Wood", "Surfaces/Wood/Flooring"],
+               "only branches with members travel: %s" % paths)
+        byid = {catalog.path_of(c["id"], items): c["id"] for c in items}
+        _check(sorted(store.load_meta(SM)["collections"])
+               == sorted([byid["Surfaces/Wood"], byid["Surfaces/Wood/Flooring"]]),
+               "multi-membership must survive the round trip")
+        _check(store.load_meta(MA)["collections"] == [],
+               "a dependency must not be filed by the package")
+        _check(sorted(library.packages_in_collection(byid["Surfaces/Wood/Flooring"]))
+               == sorted([AB, SM]), "db index must agree with the meta")
+        incremental = _index_snapshot()
+        library.rebuild_index()
+        _check(incremental == _index_snapshot(),
+               "the index a package import built incrementally must equal a "
+               "full rebuild")
+
+        # Same package again, filed into one of the user's own collections:
+        # roots only, flat, and none of the package's own branches planted.
+        mine = catalog.create("MyStuff")["id"]
+        r = pack.commit(out, {}, current_engine=ingest.engine_version(),
+                        collection=mine)
+        _check(r["ok"], "flat commit: %s" % r.get("errors"))
+        # Every root in the package, not just the two that were filed: the
+        # closure carries M_A and MI_AA, which this library promoted earlier.
+        want = sorted(p for p in (i["package"] for i in pv["items"])
+                      if store.load_meta(p)["is_root"])
+        _check(sorted(library.packages_in_collection(mine)) == want,
+               "a chosen collection takes every root in the package, flat")
+        _check(store.load_meta(TEX)["collections"] == [],
+               "a non-root must stay unfiled even for an explicit choice")
+        _check(len(catalog.load()["collections"]) == 4,
+               "a chosen collection must not plant the package's branches")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    for top in [c["id"] for c in catalog.load()["collections"] if not c["parent"]]:
+        catalog.delete(top)
+    _check(catalog.list_tree()["collections"] == [], "tree should be empty again")
+
+
 def run_target_test():
     """Import side (F3) in the target project."""
     sub = _asset_sub()
@@ -302,6 +439,8 @@ def run_target_test():
     _modify_master(False)
     p = importer.preview([AA])
     _check(p["ok"], "preview after local edit: %s" % p["errors"])
+    _check(_selected(p) == {AA},
+           "import preview must mark only the picked entry: %s" % _selected(p))
     st = _statuses(p)
     _check(st[MA] == "conflict", "locally edited M_A must conflict: %s" % st)
     r = importer.commit([AA])

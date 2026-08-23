@@ -100,10 +100,19 @@ def library_status():
 def init_library():
     """Create the library skeleton (folders + empty index) at the current
     root, so a brand-new install is usable immediately (SPEC F5, 2026-07-14).
-    Idempotent. Call after config.json was written with the chosen root."""
-    store.ensure_library_dirs()
-    return {"ok": True, "root": config.LIBRARY_ROOT,
-            "entries": library.rebuild_index()}
+    Idempotent - a root that already holds a library is adopted, not reset.
+    Call after config.json was written with the chosen root.
+
+    A failure here leaves a new user with no library and no way to guess why,
+    so the reason is spelled out rather than left as the repr-mangled path
+    str(OSError) produces (2026-08-23)."""
+    try:
+        store.ensure_library_dirs()
+        entries = library.rebuild_index()
+    except OSError as e:
+        raise RuntimeError("Could not create the library at %s: %s"
+                           % (config.LIBRARY_ROOT, e.strerror or e))
+    return {"ok": True, "root": config.LIBRARY_ROOT, "entries": entries}
 
 
 @_json_api
@@ -288,12 +297,18 @@ def package_preview(pack_path, force_version=False):
 
 
 @_json_api
-def package_commit(pack_path, decisions_json="{}", force_version=False):
-    """Import a previewed .kurapack into the library (F7 import step 3)."""
+def package_commit(pack_path, decisions_json="{}", force_version=False,
+                   collection=""):
+    """Import a previewed .kurapack into the library (F7 import step 3).
+
+    collection is what the dialog's picker returned: pack.PACK_COLLECTIONS
+    ("__package__") to rebuild the package's own filing, "" for Unsorted, or
+    an existing collection id to file the roots flat into that one."""
     with progress.Reporter("Kura: importing package") as report:
         return pack.commit(pack_path, json.loads(decisions_json),
                            current_engine=ingest.engine_version(),
-                           force_version=bool(force_version), progress=report)
+                           force_version=bool(force_version), progress=report,
+                           collection=str(collection))
 
 
 # --- PBR Material Importer (SPEC F6) --------------------------------------

@@ -185,10 +185,12 @@ namespace KuraLibrary
 	TArray<TSharedPtr<FKuraEntry>> LoadEntries(
 		const TArray<TSharedPtr<FKuraEntry>>* Previous = nullptr);
 
-	/** Folder tree read straight from disk: the top-level folders of the asset
-	 *  tree and everything under them. One tree for the whole library since
-	 *  2026-08-10 - the tabs filter by class, not by folder (Q24). */
-	TArray<TSharedPtr<FKuraFolderNode>> LoadFolderTree();
+	/** Folder tree derived from the entries: the folders that hold them, plus
+	 *  their ancestors. One tree for the whole library since 2026-08-10 - the
+	 *  tabs filter by class, not by folder (Q24). Built from memory rather
+	 *  than from a directory walk since 2026-08-23; see the definition. */
+	TArray<TSharedPtr<FKuraFolderNode>> LoadFolderTree(
+		const TArray<TSharedPtr<FKuraEntry>>& Entries);
 
 	/** Virtual classification tree from Meta/collections.json, with member
 	 *  counts taken from the given entries (SPEC F8). The Unsorted node is

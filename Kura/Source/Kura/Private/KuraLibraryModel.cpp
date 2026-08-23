@@ -96,18 +96,17 @@ namespace
 		return Cached;
 	}
 
-	void BuildFolderChildren(const FString& DiskDir, const FString& RelPath, FKuraFolderNode& Node)
+	/** Name order at every level, matching what the directory walk this
+	 *  replaced produced. */
+	void SortFolderLevel(TArray<TSharedPtr<FKuraFolderNode>>& Nodes)
 	{
-		TArray<FString> SubDirs;
-		IFileManager::Get().FindFiles(SubDirs, *(DiskDir / TEXT("*")), /*Files*/ false, /*Dirs*/ true);
-		SubDirs.Sort();
-		for (const FString& Sub : SubDirs)
+		Nodes.Sort([](const TSharedPtr<FKuraFolderNode>& A, const TSharedPtr<FKuraFolderNode>& B)
 		{
-			const TSharedPtr<FKuraFolderNode> Child = MakeShared<FKuraFolderNode>();
-			Child->Name = Sub;
-			Child->RelPath = RelPath.IsEmpty() ? Sub : RelPath + TEXT("/") + Sub;
-			BuildFolderChildren(DiskDir / Sub, Child->RelPath, *Child);
-			Node.Children.Add(Child);
+			return A->Name < B->Name;
+		});
+		for (const TSharedPtr<FKuraFolderNode>& Node : Nodes)
+		{
+			SortFolderLevel(Node->Children);
 		}
 	}
 }
@@ -284,9 +283,14 @@ TArray<TSharedPtr<FKuraEntry>> KuraLibrary::LoadEntries(
 	for (const FMetaFile& Meta : Files)
 	{
 		const FString& File = Meta.Path;
-		// Meta/ also hosts collections.json, which describes the classification
-		// tree rather than an asset (keep in sync with config.RESERVED_META_FILES).
-		if (FPaths::GetCleanFilename(File) == TEXT("collections.json"))
+		// Meta/ also hosts collections.json at its top, which describes the
+		// classification tree rather than an asset. Matched at the top level
+		// only: an asset named "collections" further down owns a meta file
+		// with exactly that name, and skipping it by name anywhere would drop
+		// that entry from the panel without a word (2026-08-23; keep in sync
+		// with config.RESERVED_META_FILES and store.iter_metas).
+		if (FPaths::GetCleanFilename(File) == TEXT("collections.json")
+			&& FPaths::IsSamePath(FPaths::GetPath(File), MetaDir))
 		{
 			continue;
 		}
@@ -448,18 +452,50 @@ int32 FKuraCollectionNode::CountForTab(int32 Tab) const
 	return Total;
 }
 
-TArray<TSharedPtr<FKuraFolderNode>> KuraLibrary::LoadFolderTree()
+TArray<TSharedPtr<FKuraFolderNode>> KuraLibrary::LoadFolderTree(
+	const TArray<TSharedPtr<FKuraEntry>>& Entries)
 {
 	// One tree for the whole asset tree since 2026-08-10 (Q24): the folder
 	// layout no longer encodes type, so there is nothing to split it by.
+	//
+	// Built from the entries rather than from a directory walk (2026-08-23).
+	// The tree is exactly "folders that hold entries, plus their ancestors",
+	// and every entry already carries its own folder - so the walk was a
+	// second full pass over the library on top of the meta walk, re-deriving
+	// what was in memory already (2,717 directory enumerations per refresh at
+	// reference scale; 0.05 s warm, 2.4 s cold). It also drops phantom nodes:
+	// a directory left behind on disk with nothing registered in it used to
+	// show up in the tree as an empty folder.
 	TArray<TSharedPtr<FKuraFolderNode>> Roots;
-	FKuraFolderNode Synthetic;
-	const FString TreeDir = GetTreeDir();
-	if (IFileManager::Get().DirectoryExists(*TreeDir))
+	TMap<FString, TSharedPtr<FKuraFolderNode>> ByPath;
+	TArray<FString> Segments;
+	for (const TSharedPtr<FKuraEntry>& E : Entries)
 	{
-		BuildFolderChildren(TreeDir, FString(), Synthetic);
+		if (E->Folder.IsEmpty())
+		{
+			continue; // an entry at the top of the tree adds no folder
+		}
+		Segments.Reset();
+		E->Folder.ParseIntoArray(Segments, TEXT("/"));
+		FString Path;
+		TArray<TSharedPtr<FKuraFolderNode>>* Siblings = &Roots;
+		for (const FString& Segment : Segments)
+		{
+			Path = Path.IsEmpty() ? Segment : Path + TEXT("/") + Segment;
+			// The node lives on the heap, so the pointer into its Children
+			// survives whatever the map does to itself on the next insert.
+			TSharedPtr<FKuraFolderNode>& Node = ByPath.FindOrAdd(Path);
+			if (!Node.IsValid())
+			{
+				Node = MakeShared<FKuraFolderNode>();
+				Node->Name = Segment;
+				Node->RelPath = Path;
+				Siblings->Add(Node);
+			}
+			Siblings = &Node->Children;
+		}
 	}
-	Roots = Synthetic.Children;
+	SortFolderLevel(Roots);
 	return Roots;
 }
 

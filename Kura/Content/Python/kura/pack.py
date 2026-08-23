@@ -15,11 +15,15 @@ import os
 import shutil
 import zipfile
 
-from . import config, library, store
+from . import catalog, config, library, store
 
 FORMAT_VERSION = 1
 MANIFEST_NAME = "kurapack.json"
 EXTENSION = ".kurapack"
+
+# Wire value the import dialog sends for "use the package's own collections".
+# Not a collection id (ids are "c_" + 8 hex), so the two can share one field.
+PACK_COLLECTIONS = "__package__"
 
 
 _version_tuple = store.version_tuple
@@ -64,6 +68,46 @@ def _thumb_name(rel):
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
+
+def _collections_block(metas):
+    """The slice of the exporter's collection tree these entries use (F7).
+
+    Keyed by full PATH, never by id: an id only names a collection inside the
+    exporter's own collections.json, which does not travel. Path is portable
+    for the same reason it is in the asset tree - it is the identity.
+
+    Only branches that actually carry a member travel, plus their ancestors:
+    a package about wood must not plant the exporter's whole taxonomy in
+    somebody else's library. Ancestors sort first so the importer can build
+    the tree in one forward pass. Returns {} when nothing here is filed, so a
+    package from a library that never used collections keeps its old shape."""
+    items = catalog.load()["collections"]
+    if not items:
+        return {}
+    byid = {c["id"]: c for c in items}
+    members, used_ids = {}, set()
+    for m in metas:
+        paths = set()
+        for cid in m.get("collections", []) or []:
+            path = catalog.path_of(cid, items)
+            if not path:
+                continue  # membership left pointing at a deleted collection
+            paths.add(path)
+            current, guard = str(cid), 0
+            while current in byid and guard <= len(items):
+                used_ids.add(current)
+                current = byid[current]["parent"]
+                guard += 1
+        if paths:
+            members[m["package"]] = sorted(paths)
+    if not members:
+        return {}
+    tree = [{"path": catalog.path_of(cid, items),
+             "order": int(byid[cid].get("order", 0) or 0)}
+            for cid in used_ids]
+    tree.sort(key=lambda e: (e["path"].count("/"), e["order"], e["path"]))
+    return {"tree": tree, "members": members}
+
 
 def export_package(packages, out_path, name="", description="", author="",
                    progress=None):
@@ -120,6 +164,14 @@ def export_package(packages, out_path, name="", description="", author="",
             "is_root": bool(m.get("is_root")),
         } for m in metas],
     }
+    # Filing rides along keyed by path (SPEC F7). Added only when there IS
+    # any, and deliberately WITHOUT bumping format_version: an older Kura
+    # hard-refuses a higher format_version but silently ignores a manifest
+    # key it does not know, so a package stays importable either way - it
+    # just lands in Unsorted there.
+    collections = _collections_block(metas)
+    if collections:
+        manifest["collections"] = collections
 
     tmp = out_path + ".kura-staging"
     try:
@@ -138,9 +190,11 @@ def export_package(packages, out_path, name="", description="", author="",
                         zipfile.ZIP_STORED)
                 # Meta travels as-is except for the collection membership,
                 # whose ids only mean anything in THIS library's
-                # collections.json - which does not travel (SPEC F8). Stripped
-                # here as well as on import so a hand-unzipped package never
-                # shows a reader ids they cannot resolve.
+                # collections.json - which does not travel (SPEC F8). The
+                # filing itself does travel, by path, in the manifest's
+                # "collections" block; the ids are stripped here as well as on
+                # import so a hand-unzipped package never shows a reader ids
+                # they cannot resolve.
                 shipped = dict(m)
                 shipped["collections"] = []
                 z.writestr(_meta_name(rel),
@@ -175,7 +229,8 @@ def _load_manifest(z):
     # message instead of leaking a Python traceback into the error dialog.
     try:
         if (not isinstance(manifest, dict)
-                or not isinstance(manifest.get("entries", []), list)):
+                or not isinstance(manifest.get("entries", []), list)
+                or not isinstance(manifest.get("collections", {}), dict)):
             raise TypeError
         int(manifest.get("format_version", 0))
         int(manifest.get("meta_schema_version", 0))
@@ -192,6 +247,30 @@ def _load_manifest(z):
             "%s - update Kura to import it"
             % (manifest.get("meta_schema_version"), config.META_SCHEMA_VERSION))
     return manifest
+
+
+def _tree_paths(block):
+    """Collection paths a manifest's "collections" block ships, ancestors
+    first. Tolerates a hand-edited manifest: anything unusable is dropped."""
+    out = []
+    for entry in (block or {}).get("tree") or []:
+        if isinstance(entry, dict):
+            path = str(entry.get("path", "")).strip()
+            if path and path not in out:
+                out.append(path)
+    return out
+
+
+def _collections_summary(block):
+    """What the import dialog needs to offer "use the package's collections"
+    (SPEC F7 import step 5): whether any filing rides along, how many
+    branches, and how many of them this library does not have yet."""
+    paths = _tree_paths(block)
+    if not paths:
+        return {"total": 0, "new": 0, "entries": 0}
+    return {"total": len(paths),
+            "new": len(catalog.ensure_paths(paths, dry_run=True)["created"]),
+            "entries": len((block or {}).get("members") or {})}
 
 
 def preview(pack_path, current_engine=None, force_version=False, progress=None):
@@ -219,6 +298,7 @@ def preview(pack_path, current_engine=None, force_version=False, progress=None):
                 ("name", "description", "author", "created_at",
                  "engine_version", "format_version")}
         info["entries"] = len(manifest.get("entries", []))
+        info["collections"] = _collections_summary(manifest.get("collections"))
         errors = []
 
         prefix = manifest.get("lib_prefix", "")
@@ -279,6 +359,9 @@ def preview(pack_path, current_engine=None, force_version=False, progress=None):
             items.append({
                 "package": pkg,
                 "class": entry.get("class", ""),
+                # No "selected" key: the user picked the whole file, so the
+                # preview dialog's "you picked this / Kura collected it"
+                # split does not apply and it drops that line entirely.
                 "status": status,
                 "size": entry.get("size", 0),
                 "sha256": entry.get("sha256", ""),
@@ -306,10 +389,13 @@ def _stage_meta(z, arc, tmp):
     """Write an incoming meta into staging with the recipient's own filing
     reset (SPEC F7 import step 5).
 
-    A package ships assets, not somebody else's organisation: collection ids
-    name collections in the EXPORTER's Meta/collections.json, which does not
-    travel, so imported entries land in Unsorted (SPEC F8). Everything else
-    rides along untouched - tags, notes and is_root describe the asset."""
+    Collection ids name collections in the EXPORTER's Meta/collections.json,
+    which does not travel, so the incoming ids are always dropped (SPEC F8).
+    The filing itself is rebuilt afterwards from the manifest's path-keyed
+    "collections" block, by _file_imported, once the entries are in place -
+    so an entry is briefly Unsorted between staging and filing, and stays
+    that way if the user picked "None (Unsorted)". Everything else rides
+    along untouched - tags, notes and is_root describe the asset."""
     with z.open(arc) as src:
         meta = json.loads(src.read().decode("utf-8"))
     meta["collections"] = []
@@ -317,11 +403,79 @@ def _stage_meta(z, arc, tmp):
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
 
+def _file_imported(packages, choice, block):
+    """Apply the import dialog's collection choice (SPEC F7 import step 5).
+
+    choice: PACK_COLLECTIONS to rebuild the package's own filing by path,
+    "" to file nothing (the entries stay in Unsorted), or an existing
+    collection id to drop every imported ROOT into that one node, flat - the
+    same semantics as the ingest dialog's picker, so a user only learns the
+    control once. In that last case the package's own paths are deliberately
+    NOT planted: the user just said where these belong.
+
+    Never raises. By the time this runs the assets are already in place, so a
+    filing problem is something to report, not something to fail an import
+    over. Returns {"choice", "filed", "created", "error"}."""
+    out = {"choice": str(choice or ""), "filed": [], "created": [], "error": ""}
+    if not out["choice"] or not packages:
+        return out
+    metas = {}
+    for pkg in packages:
+        meta = store.load_meta(pkg)
+        if meta is not None:
+            metas[pkg] = meta
+    try:
+        if out["choice"] != PACK_COLLECTIONS:
+            roots = sorted(p for p, m in metas.items() if m.get("is_root"))
+            if roots:
+                catalog.assign(roots, out["choice"], add=True)
+                out["filed"] = roots
+            return out
+
+        wanted = {}  # collection path -> [package, ...]
+        for pkg in sorted(metas):
+            for path in ((block or {}).get("members") or {}).get(pkg) or []:
+                path = str(path).strip()
+                if path:
+                    wanted.setdefault(path, []).append(pkg)
+        if not wanted:
+            return out
+        # Create the shipped branch set in one pass, ancestors first, so
+        # branches that only hold sub-collections exist too and the tree
+        # reads the way it did on the exporting side. _tree_paths is already
+        # ancestor-ordered; sorted() is the fallback for a manifest with
+        # members but no tree.
+        made = catalog.ensure_paths(_tree_paths(block) or sorted(wanted))
+        out["created"] = made["created"]
+        ids = made["ids"]
+        missing = sorted(p for p in wanted if p not in ids)
+        if missing:
+            extra = catalog.ensure_paths(missing)
+            ids.update(extra["ids"])
+            out["created"] += extra["created"]
+        filed = []
+        for path, pkgs in sorted(wanted.items()):
+            cid = ids.get(path)
+            if cid:
+                catalog.assign(pkgs, cid, add=True)
+                filed += pkgs
+        out["filed"] = sorted(set(filed))
+    except (OSError, ValueError, RuntimeError) as e:
+        out["error"] = str(e)
+    return out
+
+
 def commit(pack_path, decisions=None, current_engine=None, force_version=False,
-           progress=None):
+           progress=None, collection=""):
     """Import a package into the library (F7 import steps 2-3).
 
     decisions: {package: "update" | "keep"} for every conflict item.
+    collection: where the imported entries get filed - PACK_COLLECTIONS,
+    "" (Unsorted), or an existing collection id. Filing runs last, after
+    rebuild_index(), because it is a meta write plus an index update; it
+    covers everything except entries the user explicitly chose to Ignore
+    (status "same" included, so re-importing a package fixes filing that
+    predates this feature), and it never fails the import.
     "update" archives the current library version first (restorable from
     Recently Deleted); the package's meta then replaces the old meta wholesale
     - meta travels as-is, so local tag edits live on in the archived copy.
@@ -357,9 +511,19 @@ def commit(pack_path, decisions=None, current_engine=None, force_version=False,
     # ingest/import staging).
     store.ensure_library_dirs()
     staged = []  # (item, [(tmp, final), ...])
+    pack_collections = {}
     try:
         with zipfile.ZipFile(pack_path) as z:
             names = set(z.namelist())
+            # Re-read rather than thread it out of preview(): the manifest is
+            # a few KB and this zip is open anyway, even when plan is empty.
+            # preview() already validated it, so a failure here can only mean
+            # the file changed underneath us - filing is not worth aborting a
+            # staged import for.
+            try:
+                pack_collections = _load_manifest(z).get("collections") or {}
+            except ValueError:
+                pack_collections = {}
             for idx, item in enumerate(plan, 1):
                 pkg = item["package"]
                 if progress is not None:
@@ -380,6 +544,12 @@ def commit(pack_path, decisions=None, current_engine=None, force_version=False,
                         with z.open(arc) as src, open(tmp, "wb") as dst:
                             shutil.copyfileobj(src, dst, 1 << 20)
                     files.append((tmp, final))
+                if not files:
+                    # preview() checked the tree file is in the zip; getting
+                    # here means the file changed underneath us.
+                    raise ValueError(
+                        "%s is missing from the package - it changed while "
+                        "the import was running" % pkg)
                 staged.append((item, files))
                 tree_tmp = files[0][0]
                 if store.sha256_of(tree_tmp) != item["sha256"]:
@@ -388,7 +558,12 @@ def commit(pack_path, decisions=None, current_engine=None, force_version=False,
                         "corrupted (re-download it), or the library it was "
                         "exported from had unverified changes (run Verify "
                         "Library there and re-export)" % pkg)
-    except (OSError, zipfile.BadZipFile) as e:
+    except Exception as e:  # noqa: BLE001 - staging must always clean up
+        # Broader than OSError on purpose: a corrupt meta inside the package
+        # raises JSONDecodeError out of _stage_meta, and anything else that
+        # escapes here would leave *.kura-staging files behind for the user to
+        # find and delete by hand (2026-08-23). Nothing is committed yet, so
+        # there is no state to salvage - only files to remove.
         _cleanup_staged(staged)
         return {"ok": False, "added": [], "updated": [], "skipped": skipped,
                 "errors": ["Package staging failed - the library was not "
@@ -417,6 +592,17 @@ def commit(pack_path, decisions=None, current_engine=None, force_version=False,
         return {"ok": False, "errors": errors, "added": added,
                 "updated": updated, "skipped": skipped}
 
-    library.rebuild_index()
+    # Re-reading every meta file in the library to register this import cost
+    # 1.31 s at 10,833 entries regardless of package size (2026-08-23). The
+    # meta files just landed on disk, so read back only those; an import never
+    # removes an entry, so no row can go stale.
+    library.update_entries(store.load_meta(p) for p in added + updated)
+    # Everything that came in OR was already identical, minus what the user
+    # chose to Ignore: filing a "same" entry is what makes re-importing a
+    # package repair filing done before packages carried any.
+    filable = [i["package"] for i in p["items"]
+               if decisions.get(i["package"]) != "keep"]
     return {"ok": True, "errors": [], "added": added, "updated": updated,
-            "skipped": skipped}
+            "skipped": skipped,
+            "collections": _file_imported(filable, collection,
+                                          pack_collections)}
