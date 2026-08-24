@@ -17,8 +17,6 @@ Send assets to your library, browse and organise them with thumbnails, tags and 
 
 ![The Kura library panel](Docs/media/panel.png)
 
-![Kura in action](Docs/media/overview.gif)
-
 ## 💡 Why Kura
 
 Every UE artist ends up with a pile of old projects kept alive only because "the good chair is in there somewhere." Kura replaces that with one library folder on disk that every project can reach.
@@ -32,24 +30,32 @@ Every UE artist ends up with a pile of old projects kept alive only because "the
 
 ## ⚙️ How it works
 
-Kura keeps every library asset under a stable path — `/Game/_AssetLib/...` — that is identical in the library and in every project. Because `.uasset` files reference each other by package path, keeping the path stable means ingest and import are pure file copies with zero reference rewriting. The path is an asset's *identity*; its content hash is its *version*. Same path + same hash = deduplicated automatically. Same path + different hash = a conflict dialog, never a silent overwrite: uploading over a library asset archives the version it replaces, while importing over a project asset replaces that file outright — the archive guards library data, and the import dialog tells you so before you confirm.
+Every library asset keeps one stable path — `/Game/_AssetLib/...` — identical in the library and in every project. Since `.uasset` files reference each other by path, ingest and import are pure file copies: no reference rewriting, nothing to fix up afterwards.
+
+**Path is identity, hash is version.** Same hash: skipped as a duplicate. Different hash: a conflict dialog, never a silent overwrite. Overwrites in the library go to a restorable archive; an import that replaces a file in your project does not.
 
 ## ✨ Features
 
-- **Library browser panel** — class tabs (All Assets / Static Meshes / Materials / Textures), a Collections / Folders tree, and a thumbnail grid with multi-select. Three orthogonal controls: the tab picks *what kind*, the tree picks *which ones*, **Show Dependencies** reveals *what they are made of* — in Collections, the materials and textures the selected assets exclusively own, with shared masters staying out of the way; in Folders, simply the non-root files stored there. Tabs only ever filter the grid; the tree never changes shape, each row just reports how many assets *this* tab would list.
-- **Collections** — your own nested classification, kept entirely in metadata: file an asset into as many collections as you like, rename or reorganise them at any time, and nothing on disk is touched. Anything you have uploaded but not filed waits under **Unsorted**, and a whole collection can be imported in one go.
-- **Shared Dependencies** — a built-in view, pinned below the collection tree, listing everything referenced by two or more library assets: master materials, material functions, parameter collections, shared textures. It is computed from the reference graph, so it stays accurate on its own — there is nothing to file and nothing to maintain.
-- **Search, tags and dependency links** — search across names, paths, tags and notes, filter by tag, and move around the tree from a details panel with clickable dependency / referenced-by links.
-- **Ingest with a preview** — every upload shows New / Identical / Conflict per asset before anything is written; conflicts offer Update (old version archived) or Ignore, per item or in bulk. **Mark Dependencies as Roots** lists the auto-collected dependencies as library entries in their own right, so you never have to send a folder of textures twice.
-- **Batch tagging** — tag a whole upload at once (e.g. `polyhaven`). Assets that arrive unchanged are skipped and keep their tags, so a shared master material never collects the tag of every pack that happens to use it; assets you update do take the new tags, on top of the ones they already had.
-- **Shared masters stored once** — if two material instances use the same master material, the library keeps a single copy of it. Import both into a project and there is still one master — by design, not by luck.
-- **Version guard** — assets saved by a newer engine are blocked from importing into an older one. There is an override, but expect it to help only within the same engine version: force an import across versions and the files land in your project unloadable.
-- **Safe deletes** — nothing is hard-deleted: entries go to an archive and come back from **⋮ → Library → *Recently Deleted***. Deleting a material also offers to archive the textures it brought in when nothing else uses them, in the same restorable batch — never the assets you sent to Kura yourself — and **⋮ → Library → *Clean Unused Dependencies*** sweeps the whole library for leftovers.
-- **`.kurapack` packages** — export any selection or folder (dependencies included) as a single file another Kura library can import.
-- **Portable data layer** — per-asset JSON + thumbnails on disk; the database is a cache that can always be rebuilt (**⋮ → Library → *Verify Library***).
-- **PBR Material Importer** — point it at a folder of downloaded PBR texture sets; it imports the textures with correct sRGB/compression settings, renames them consistently, and builds a Material Instance per set wired to your master material. It only touches the current project — nothing is sent to the library (**⋮ → *This Project* → *Build Material Instances from Textures***).
+- **Library browser** — class tabs, a Collections / Folders tree and a thumbnail grid with multi-select. The tab picks *what kind*, the tree picks *which ones*, **Show Dependencies** shows *what they are made of*.
+- **Collections** — nested categories held in metadata only: file one asset into several, rename or reorganise them any time, nothing on disk moves. Unfiled uploads wait under **Unsorted**.
+- **Shared Dependencies** — a built-in view of everything two or more assets reference: masters, material functions, shared textures. Computed from the reference graph, so there is nothing to file and nothing to maintain.
+- **Search and tags** — search names, paths, tags and notes, filter by tag, and follow clickable dependency / referenced-by links.
+- **Preview before every write** — uploads and imports list each asset as New, Identical or Conflict; conflicts offer Update or Ignore, per item or in bulk. **Mark Dependencies as Roots** promotes collected dependencies to entries of their own.
+- **Batch tagging** — tag a whole upload at once. Unchanged assets are skipped and keep their own tags, so a shared master never collects the tag of every pack that uses it.
+- **Shared masters stored once** — two material instances that share a master keep one copy of it in the library, and one in the project you import them into.
+- **Version guard** — assets saved by a newer engine are blocked from importing into an older one, with the reason named.
+- **Safe deletes** — nothing is hard-deleted: entries go to a restorable archive, and dependencies nothing else uses can be swept in the same batch or later.
+- **`.kurapack` packages** — export any selection or folder, dependency closure included, as one file another Kura library can import.
+- **Portable data layer** — per-asset JSON and thumbnails on disk; the database is only a cache and rebuilds from them.
+- **PBR Material Importer** — point it at a folder of PBR texture sets: textures imported with the right sRGB and compression settings, one Material Instance built per set. Current project only, nothing sent to the library.
+
+**Sending assets to the library** — right-click in the Content Browser, review what comes along, confirm.
 
 ![Send to Kura](Docs/media/send-to-kura.gif)
+
+**Importing into a project** — find it in the panel, one click, dependencies and paths intact.
+
+![Importing from the library](Docs/media/import.gif)
 
 ## 📥 Installation
 
@@ -59,41 +65,32 @@ Kura keeps every library asset under a stable path — `/Game/_AssetLib/...` —
 | OS | Windows 10 / 11 |
 | Projects | Blueprint-only and C++ projects both work |
 
-1. Download the zip for your engine version from [Releases](https://github.com/Yashashin/Kura/releases). Plugin binaries are engine-specific; the wrong zip will not load.
-2. Extract it into that engine's plugin folder, so that `...\UE_5.7\Engine\Plugins\Marketplace\Kura\Kura.uplugin` exists. Writing under `Program Files` needs administrator rights.
-3. Start the editor, enable *Kura* in **Edit → Plugins** (its Python dependencies come along automatically) and restart when prompted. Then open **Tools → Kura Library** — on first run Kura asks where to keep your library and creates it for you.
-
-Installing into the engine rather than into one project is deliberate: your library is meant to be reachable from *every* project. If you would rather not touch `Program Files`, put the `Kura` folder in `<YourProject>\Plugins\` instead — the zip ships precompiled binaries, so Blueprint-only projects work too, and you repeat it per project. Either way there is only one library.
+1. Download the zip for your engine version from [Releases](https://github.com/Yashashin/Kura/releases) — and `Kura_Starter.kurapack` while you are there, for the quick start below. Plugin binaries are engine-specific; the wrong zip will not load.
+2. Extract it into that engine's plugin folder, so that `...\UE_5.7\Engine\Plugins\Marketplace\Kura\Kura.uplugin` exists.
+3. Start the editor, enable *Kura* in **Edit → Plugins** (its Python dependencies come along automatically) and restart when prompted.
 
 ## 🚀 Quick start
 
-1. Open the panel: **Tools → Kura Library**. An empty library offers **Create _AssetLib Folder** right there (or **⋮ → This Project → Create _AssetLib Folder** any time) — that adds `/Game/_AssetLib` to your current project.
-2. Move the assets you want to keep into it, using the Content Browser as usual.
-3. Right-click them → **Send to Kura**. Review the upload preview, add a tag or two, pick a collection if you have one, confirm.
-4. In any other project: open the panel, find the asset, right-click → **Import**. Done — the asset and everything it depends on land at the same paths they had.
+1. **Open the panel** — **Tools → Kura Library**. On first run Kura asks where to keep your library and creates it for you.
+2. **Import the sample pack** — load `Kura_Starter.kurapack` with **⋮ → Library → Import Package** (the empty-library screen offers the same button). You get a filled library to click around in before you commit anything of your own.
+3. **Import an asset into your project** — right-click a tile → **Import**. The asset and its whole dependency chain land at the paths they had in the library.
+4. **Send in assets of your own** — **⋮ → This Project → Create _AssetLib Folder** adds `/Game/_AssetLib` to the project. Move what you want to keep into it in the Content Browser, select it, right-click → **Send to Kura**, then review the preview, add a tag or two, pick a collection, confirm.
 
 A few things worth knowing early:
 
-- Assets must sit under `/Game/_AssetLib` before upload — Kura validates that and never moves your files. Where they go underneath is up to you.
 - Library entries can be Static Meshes, Materials, Material Instances and Textures. Whatever they reference — material functions, curves, textures — comes along on its own.
-- **Folders are storage; collections are organisation.** A library folder is also the asset's path, so it is fixed at upload time. Reorganising happens in **Collections** — create, nest and re-file freely, put one asset in several collections, nothing on disk moves. Assets you have not filed yet wait under **Unsorted**.
-- A layout that works well: one folder per asset holding its own textures, plus `Shared/Master`, `Shared/Functions`, `Shared/Parameters` and `Shared/Textures` for anything meant to be reused. **Keep categories out of the path** — a folder can never move once something references it, and categories are exactly what you change your mind about. Put in the path only what will never change: what an asset *is*, and, for a whole batch from one source, where it came from.
-- Shared material masters and functions need no filing of their own. Whatever ends up referenced by two or more assets appears automatically under **Shared Dependencies**, below the collection tree.
+- **Folders are storage; collections are organisation.** A library folder is also the asset's path, so it is fixed at upload time — **keep categories out of it**, since categories are exactly what you change your mind about. A layout that works: one folder per asset with its own textures, plus a `Shared/` folder for anything reused.
 - Never rename files inside the library folder by hand — that breaks references by definition. Rename in a project, re-upload, delete the old entry.
 
 ## 📦 Sharing assets: `.kurapack`
 
-Right-click a selection of tiles → **Export as Package**, or a folder in the tree → **Export Folder as Package**. Either way the dependency closure comes along — including dependencies that live outside the folder you picked, so a package is never a broken subset.
+Right-click tiles → **Export as Package**, or a folder in the tree → **Export Folder as Package**. The dependency closure comes along, so a package is never a broken subset.
 
-The result is one self-contained file (zip layout, inspectable) carrying assets, metadata, tags and thumbnails. Another Kura user imports it via **⋮ → Library → Import Package**: identical entries are skipped, changed ones prompt — the same identity rules as everything else, so packages can overlap freely and shared masters still deduplicate. Every file is hash-verified on import, so a corrupted download aborts cleanly without touching the library.
+The result is one self-contained file — assets, metadata, tags and thumbnails — that another Kura library imports with **⋮ → Library → Import Package**. Identical entries are skipped, changed ones prompt, and every file is hash-verified. Packages carry their collections too: the import dialog lets you keep them, file everything into one collection of your own, or skip filing entirely.
 
-A package also carries its collections, keyed by path rather than by id, so importing one files its assets into the same categories they had on the other side instead of dropping them all into *Unsorted*. The import dialog lets you take those collections, put everything into one collection of your own, or skip filing entirely.
+### More assets!
 
-### Something to import
-
-Kura ships empty. Every [release](https://github.com/Yashashin/Kura/releases) has **`Kura_Starter.kurapack`** attached — 262 MB, eight surface materials (wood, brick, stone, concrete, metal, fabric, leather, ground) plus the master material, material functions and textures behind them. Import it with **⋮ → Library → Import Package** to walk the flow once and see a filled library: nine tiles, a collection tree, source tags to filter by, and the shared material functions listed under **Shared Dependencies**.
-
-Beyond that, my own material library is published in full: **[2,680 CC0 materials across 33 packs](Docs/packs.md)**, from [Poly Haven](https://polyhaven.com) and [ambientCG](https://ambientcg.com), free to download and pick from. Import the starter pack first and every pack after it will skip the two dozen-odd assets they all share — deduplication doing its job in front of you. Those packs are a snapshot, published as-is and not maintained; the plugin is the thing I support.
+Kura ships empty, so I put my own material library up for anyone to take: **[2,680 CC0 materials across 33 packs](Docs/packs.md)** from [Poly Haven](https://polyhaven.com) and [ambientCG](https://ambientcg.com), plus the sample pack attached to every [release](https://github.com/Yashashin/Kura/releases). Import the sample pack first and every pack after it will skip the assets they share.
 
 ## 🛠️ Configuration
 
@@ -109,9 +106,9 @@ Most of this lives in the panel (**⋮ → Settings**); the file behind it is `%
 | `thumb_orbit_zoom` | `0` | Thumbnail camera distance offset (negative = closer) |
 | `thumb_resolution` | `256` | Thumbnail PNG size, 32–2048 |
 
-Thumbnail settings apply to thumbnails rendered from then on — the ones already in your library keep the look they were made with until you refresh them (tile right-click → **Refresh Thumbnail**). The three orbit values are narrower than they look: they steer **material** thumbnails only, and only while a material preview mesh is set — without one every class renders on its own thumbnail info and they are ignored (the Settings dialog greys them out to say so). Static meshes always keep the angle you gave them in the Content Browser.
+Thumbnail settings apply from then on; the ones already in your library keep the look they were made with until you refresh them (tile right-click → **Refresh Thumbnail**). The three orbit values steer **material** thumbnails only, and only while a preview mesh is set — without one the Settings dialog greys them out. Static meshes keep the angle you gave them in the Content Browser.
 
-The panel writes its own state into the same file. The first two are also editable in **Settings** (*Default Tile Size* and *Show Dependencies by Default*); the rest simply remember what you last did:
+The panel keeps its own state in the same file. The first two are also in **Settings**; the rest just remember what you last did:
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -123,8 +120,6 @@ The panel writes its own state into the same file. The first two are also editab
 | `ingest_collection` | *(empty)* | Remembers the collection last picked in the upload preview |
 | `collections_view` | `1` | 1 = left column shows Collections, 0 = Folders |
 
-The PBR Material Importer keeps its own editable keyword table in `%APPDATA%\Kura\pbr_importer.json`.
-
 ## 📂 Where Kura keeps things
 
 | Path | Contents |
@@ -135,27 +130,27 @@ The PBR Material Importer keeps its own editable keyword table in `%APPDATA%\Kur
 | `<library root>\library.db` | SQLite index; a cache, rebuildable any time with **Verify Library** |
 | `<library root>\_archive\` | overwritten and deleted versions; it only grows, until you clear entries for good from **Recently Deleted** |
 | `%APPDATA%\Kura\config.json` | settings |
-| `%APPDATA%\Kura\pbr_importer.json` | PBR importer keyword table |
+| `%APPDATA%\Kura\pbr_importer.json` | PBR importer keyword table — editable |
 
 Back up the library root and you have backed up everything that matters — the two `%APPDATA%` files only hold preferences.
 
-Kura writes into your *project* when you ask it to — **Import**, **Create _AssetLib Folder** and the PBR Material Importer — plus two small things while preparing an upload: it runs Fix Up Redirectors over `/Game/_AssetLib`, and it saves any asset in the selection that still has unsaved edits, so that what lands in the library is what is on disk. Nothing else touches project assets: browsing never writes, and thumbnail rendering applies a transient camera / preview-mesh override that is undone — dirty flag included — the moment the PNG is written.
+Kura writes into your *project* only when you ask: **Import**, **Create _AssetLib Folder**, the PBR Material Importer. Preparing an upload adds two small ones — Fix Up Redirectors over `/Game/_AssetLib`, and saving any selected asset with unsaved edits, so what lands in the library is what is on disk. Nothing else: browsing never writes, and the thumbnail camera override is undone, dirty flag included, the moment the PNG exists.
 
 ## 🔄 Updating and uninstalling
 
-- **Update:** close the editor, then replace the `Kura` plugin folder with the contents of the new zip, wherever you installed it (under `Program Files` that still needs administrator rights). A newer Kura reads your existing library as it is — there is nothing to migrate (next section).
-- **Uninstall:** delete the `Kura` plugin folder — one per project, if that is how you installed it. Your library folder and `%APPDATA%\Kura` are left alone; remove them by hand if you want the data gone too.
+- **Update:** close the editor, then replace the `Kura` plugin folder with the contents of the new zip, wherever you installed it. A newer Kura reads your existing library as it is — there is nothing to migrate (next section).
+- **Uninstall:** delete the `Kura` plugin folder. Your library folder and `%APPDATA%\Kura` are left alone; remove them by hand if you want the data gone too.
 
 ## 🎮 Engine versions & library format
 
 - **Supported engines: UE 5.7 and 5.8.** The policy is the current engine plus the previous one. Each release ships one zip per engine version — plugin binaries are never interchangeable between engine versions.
-- **Assets only travel upward.** The starter pack and the asset packs are built with UE 5.7, so they import into 5.7 and 5.8 alike. That direction is an engine rule rather than a Kura one: a `.uasset` records the version that saved it, an older engine refuses to load a newer one, and Unreal has no "save as an older version". Kura's version guard catches this at import time and tells you why, instead of leaving you with an editor that fails to open the file.
+- **Assets only travel upward.** The sample pack and the asset packs are built with UE 5.7, so they import into 5.7 and 5.8 alike. That direction is an engine rule rather than a Kura one: a `.uasset` records the version that saved it, an older engine refuses to load a newer one, and Unreal has no "save as an older version". Kura's version guard catches this at import time and tells you why, instead of leaving you with an editor that fails to open the file.
 - **Working across both versions?** The engine that uploads an asset sets that asset's floor — send it from 5.8 and only 5.8 can import it back, send it from 5.7 and either engine can. A mixed library is fine: the guard is per asset, and an import is blocked only when something in its dependency closure is too new. The simple rule is to upload from the older engine.
 - **Library format:** each asset's metadata carries a `schema_version` (currently 2). New fields always arrive with a default and existing ones are never renamed or repurposed, so a newer Kura reads an older library as it is and upgrades entries one at a time as it rewrites them — never a bulk rewrite of a library it did not create. A `.kurapack` built by a newer Kura than yours is refused on import, with a message telling you to update. The same holds for a whole library: if you open one written by a newer Kura, it stays readable — browse it, import from it — but any change to it is refused rather than risk dropping fields this build does not know about. *Verify Library* lists the entries this applies to.
 
 ## ⚠️ Known limitations
 
-- **Windows only; UE 5.7 and 5.8 only.** Older engines are not supported.
+- **Windows only.** There is no macOS or Linux build.
 - **Uploadable types:** Static Mesh, Material, Material Instance, Texture (2D / Cube / Array). Skeletal Meshes, Blueprints, Niagara systems, levels and animation assets cannot be library entries. Dependency-only classes that a supported asset references (material functions, curves, …) come along fine and show up under the **All Assets** tab.
 - **Content from other plugins is blocked.** Only `/Game` (copied into the library) and `/Engine` (recorded in metadata, not copied) are supported. Anything depending on `/Fab/` or another plugin mount — Fab / Quixel Bridge content, plugins that ship content — is rejected with the offending references listed. Move what you need into `/Game` first.
 - **One library at a time.** Kura points at a single `library_root`; switching means changing the setting.
@@ -165,30 +160,24 @@ Kura writes into your *project* when you ask it to — **Import**, **Create _Ass
 
 ## ❓ FAQ
 
-**How is this different from Migrate?**
-Migrate is a one-shot copy between two projects: you still have to own the source project, remember which one it was, find the asset inside it, and clean up afterwards. Kura is the library Migrate never came with — one folder, browsable with thumbnails and tags, that every project can pull from. Underneath it is the same principle (copy the files, keep the paths), automated, with deduplication and versioning on top.
-
-**How is it different from Fab or Quixel Bridge?**
-Those are storefronts for *their* content. Kura is for *yours* — what you made, what you bought elsewhere, what you downloaded as CC0.
+**Why does everything have to live under `/Game/_AssetLib`?**
+Because that is what makes import a plain file copy. A package path is baked into every `.uasset` that references it, so holding one path — the same in the library as in every project — is what lets Kura move files in and out without rewriting references or leaving redirectors behind. You can rename the prefix (`lib_prefix`) before you put anything in the library, but not after: it is the identity of everything already in there.
 
 **Can I upload assets I bought on Fab or the Marketplace?**
 If they live under `/Game`, Kura will take them — it does not inspect licences. Whether you may keep them in a personal library, and whether you may put them in a `.kurapack` you hand to someone else, is between you and that asset's licence. Most store licences allow reuse across your own projects; essentially none allow redistribution. Content that lives in a plugin mount is blocked outright (see limitations).
 
-**Can my team share one library?**
-Technically yes — put it on a share and point everyone at it. There is no locking or permissions, so treat it as read-mostly: one person curates and uploads, everyone else imports. For a real team workflow, exporting `.kurapack` files into whatever file sharing you already use is safer.
+**Can I move my library to another drive, or to another machine?**
+Move the folder, then point **⋮ → Settings → Library Root** at where it went. Nothing inside records an absolute path — assets, metadata and the index are all keyed by their `/Game/_AssetLib` path — so the same library works from any drive, and copying the library root is a complete backup.
 
 **Two of my projects have a different `M_Wood` at the same path. Now what?**
 Kura reports a version conflict, because the path is the identity. If they really are different materials, rename one of them in its project and upload again — you'll end up with both. If one is simply the newer version, choose *Update*; the old one goes to `_archive`.
 
-**A thumbnail is missing or blurry.**
-Right-click the tile → **Refresh Thumbnail**. It needs the asset to exist in the *current* project at its library path with matching content, so import it first, then refresh.
-
 ## ❤️ Support
 
-Kura is free, and there is no paid version planned. If it saves you time and you feel like it, you can [buy me a coffee](https://ko-fi.com/yukio1024).
+Bugs and feature requests are welcome in [Issues](https://github.com/Yashashin/Kura/issues).
 
-What that buys: nothing. It is a thank-you, not a transaction — no priority support, no influence on what gets built, no supporter-only features. Issues are read the same way whether you have donated or not.
+Kura is free, and there is no paid version planned. If it saves you time and you feel like it, you can [buy me a coffee](https://ko-fi.com/yukio1024) — knowing that this is useful to someone is what keeps me building it.
 
 ## 📄 License
 
-[MIT](LICENSE) — © 2026 Yashashin.
+[MIT](LICENSE) — © 2026 Yukio.

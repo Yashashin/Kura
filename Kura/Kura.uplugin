@@ -5,7 +5,7 @@
 	"FriendlyName": "Kura",
 	"Description": "Personal asset library for Unreal Engine: collect your meshes, materials and textures into one library, browse it with thumbnails and tags, and re-import assets with their dependencies into any project via stable /Game/_AssetLib paths. Includes a PBR texture-set importer and shareable .kurapack packages.",
 	"Category": "Editor",
-	"CreatedBy": "Yashashin",
+	"CreatedBy": "Yukio",
 	"CreatedByURL": "https://github.com/Yashashin",
 	"DocsURL": "https://github.com/Yashashin/Kura",
 	"SupportURL": "https://github.com/Yashashin/Kura/issues",
