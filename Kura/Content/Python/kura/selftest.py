@@ -8,13 +8,16 @@ Test chain (created procedurally, laid out by the SPEC 5.4 convention:
 a root plus its exclusive deps per folder, shared assets parked centrally):
 SM_KuraTest -> MI_AA -> M_A -> T_KuraTest ; MI_AB -> M_A (shared master)
 """
+import base64
+import json
 import os
 import shutil
 import tempfile
 
 import unreal
 
-from . import catalog, config, importer, ingest, library, manage, pack, store
+from . import (catalog, config, editor_api, importer, ingest, library, manage,
+               pack, store)
 
 TEX = config.LIB_PREFIX + "/Shared/Textures/T_KuraTest"
 MA = config.LIB_PREFIX + "/Shared/Master/M_A"
@@ -59,6 +62,50 @@ def _selected(result):
     """The packages a preview says the user picked, as opposed to the ones
     the closure pulled in (the preview dialog's second axis, 2026-08-23)."""
     return {i["package"] for i in result["items"] if i.get("selected")}
+
+
+def _init_library():
+    """editor_api.init_library() decoded - the C++ bridge hands C++ base64 of
+    the JSON, and the first-run flow is worth testing through the entry point
+    it actually calls (2026-08-27)."""
+    return json.loads(base64.b64decode(editor_api.init_library()).decode("utf-8"))
+
+
+def _run_seed_check():
+    """A brand-new library opens with the starting collection tree, in the
+    order DEFAULT_TREE lists it (2026-08-27). Runs on the reset library,
+    before anything is filed, and hands back an empty tree so the collection
+    checks downstream still start from nothing."""
+    _check(not os.path.isfile(config.COLLECTIONS_FILE),
+           "seed check must start with no collections.json")
+    r = _init_library()
+    _check(r["ok"] and r["entries"] == 0, "init_library on a fresh root: %s" % r)
+    _check(r["collections"] == len(catalog.DEFAULT_TREE),
+           "a new library must be seeded with the whole tree: %s" % r)
+
+    rows = catalog.list_tree()["collections"]
+    items = catalog.load()["collections"]
+    _check([catalog.path_of(c["id"], items) for c in rows]
+           == list(catalog.DEFAULT_TREE),
+           "the seeded tree must read back in DEFAULT_TREE order")
+    _check(all(c["count"] == 0 for c in rows),
+           "a seeded tree files nothing by itself")
+
+    _check(_init_library()["collections"] == 0, "seeding must not run twice")
+    _check(len(catalog.list_tree()["collections"]) == len(catalog.DEFAULT_TREE),
+           "the second init must leave the tree exactly as it was")
+
+    # The guard is the file, not an empty tree: emptying the tree is a
+    # decision, and finding it back after the next restart would make that
+    # decision unmakeable.
+    for top in [c for c in catalog.load()["collections"] if not c["parent"]]:
+        catalog.delete(top["id"])
+    _check(catalog.list_tree()["collections"] == [],
+           "deleting every top-level collection must empty the tree")
+    _check(_init_library()["collections"] == 0,
+           "an emptied tree must never be re-seeded")
+    _check(catalog.list_tree()["collections"] == [],
+           "re-opening an emptied library must leave it empty")
 
 
 def _reset_library():
@@ -134,6 +181,7 @@ def run_host_test():
     """Ingest side (F1) in the host project."""
     sub = _asset_sub()
     _reset_library()
+    _run_seed_check()
     _make_assets()
 
     # --- placement validation (SPEC 5.4): only "under the prefix" remains ---
@@ -240,6 +288,17 @@ def run_host_test():
 
     _run_collection_checks(furniture)
     _run_pack_collection_checks()
+
+    # Adopting a root that already holds assets must leave its filing alone
+    # (2026-08-27) - "Use This Folder" on an existing library comes through
+    # this same call, and seeding it would be filing someone else's library.
+    before = catalog.list_tree()["collections"]
+    r = _init_library()
+    _check(r["ok"] and r["entries"] > 0 and r["collections"] == 0,
+           "adopting a filled library must not seed: %s" % r)
+    _check(catalog.list_tree()["collections"] == before,
+           "adopting must leave the collection tree exactly as it was")
+
     _run_reserved_name_check()
 
     unreal.log_warning("Kura selftest HOST PASS (5 entries, master unique, "

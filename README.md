@@ -38,7 +38,7 @@ Every library asset keeps one stable path — `/Game/_AssetLib/...` — identica
 ## ✨ Features
 
 - **Library browser** — class tabs, a Collections / Folders tree and a thumbnail grid with multi-select. The tab picks *what kind*, the tree picks *which ones*, **Show Dependencies** shows *what they are made of*.
-- **Collections** — nested categories held in metadata only: file one asset into several, rename or reorganise them any time, nothing on disk moves. Unfiled uploads wait under **Unsorted**.
+- **Collections** — nested categories held in metadata only: file one asset into several, rename or reorganise them any time, nothing on disk moves. A new library starts with a ready-made tree (Surfaces, Props, Nature, Architecture, Utility) so there is something to file into from your very first upload — rename, delete or nest it into whatever suits your work. Unfiled uploads wait under **Unsorted**.
 - **Shared Dependencies** — a built-in view of everything two or more assets reference: masters, material functions, shared textures. Computed from the reference graph, so there is nothing to file and nothing to maintain.
 - **Search and tags** — search names, paths, tags and notes, filter by tag, and follow clickable dependency / referenced-by links.
 - **Preview before every write** — uploads and imports list each asset as New, Identical or Conflict; conflicts offer Update or Ignore, per item or in bulk. **Mark Dependencies as Roots** promotes collected dependencies to entries of their own.
@@ -72,7 +72,7 @@ Every library asset keeps one stable path — `/Game/_AssetLib/...` — identica
 
 ## 🚀 Quick start
 
-1. **Open the panel** — **Tools → Kura Library**. On first run Kura asks where to keep your library and creates it for you.
+1. **Open the panel** — **Tools → Kura Library**. On first run Kura asks where to keep your library, creates it for you and fills the Collections tree with a starting set of categories.
 2. **Import the sample pack** — load `Kura_Starter.kurapack` with **⋮ → Library → Import Package** (the empty-library screen offers the same button). You get a filled library to click around in before you commit anything of your own.
 3. **Import an asset into your project** — right-click a tile → **Import**. The asset and its whole dependency chain land at the paths they had in the library.
 4. **Send in assets of your own** — **⋮ → This Project → Create _AssetLib Folder** adds `/Game/_AssetLib` to the project. Move what you want to keep into it in the Content Browser, select it, right-click → **Send to Kura**, then review the preview, add a tag or two, pick a collection, confirm.

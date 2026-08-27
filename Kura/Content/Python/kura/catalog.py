@@ -30,6 +30,160 @@ from . import config, library, store
 # new field with a default, not a breaking change.
 CATALOG_SCHEMA_VERSION = 1
 
+# The tree a brand-new library starts with (2026-08-27, reversing the
+# 2026-08-22 veto). An empty library used to open with no collections at all,
+# which left the ingest dialog's Collection dropdown offering nothing but
+# "None (Unsorted)": the one moment a user knows what an asset IS, is the one
+# moment Kura gave them no way to say so. A starting tree costs nothing to
+# ignore - rename, delete or nest anything, and only newly created libraries
+# are seeded - but it turns filing into picking from a list.
+#
+# Depth-first in display order: ensure_paths() numbers siblings in the order
+# it first meets them, so this listing IS the order the panel shows. Every
+# node is spelled out rather than leaves only, so the shape stays readable
+# and a branch that should exist empty (a place to file into later) does.
+DEFAULT_TREE = (
+    "Surfaces",
+    "Surfaces/Wood",
+    "Surfaces/Wood/Planks & Boards",
+    "Surfaces/Wood/Flooring",
+    "Surfaces/Wood/Raw & Rough",
+    "Surfaces/Wood/Painted & Treated",
+    "Surfaces/Wood/Bark",
+    "Surfaces/Metal",
+    "Surfaces/Metal/Clean & Brushed",
+    "Surfaces/Metal/Painted & Coated",
+    "Surfaces/Metal/Rusted & Weathered",
+    "Surfaces/Metal/Plates & Panels",
+    "Surfaces/Metal/Mesh & Perforated",
+    "Surfaces/Stone",
+    "Surfaces/Stone/Rock & Cliff",
+    "Surfaces/Stone/Marble",
+    "Surfaces/Stone/Granite & Slate",
+    "Surfaces/Stone/Cut & Polished",
+    "Surfaces/Stone/Masonry",
+    "Surfaces/Brick",
+    "Surfaces/Brick/Modern",
+    "Surfaces/Brick/Old & Weathered",
+    "Surfaces/Brick/Painted",
+    "Surfaces/Concrete",
+    "Surfaces/Concrete/Smooth & Polished",
+    "Surfaces/Concrete/Rough",
+    "Surfaces/Concrete/Damaged & Stained",
+    "Surfaces/Plaster & Paint",
+    "Surfaces/Plaster & Paint/Plaster",
+    "Surfaces/Plaster & Paint/Painted Wall",
+    "Surfaces/Tiles",
+    "Surfaces/Tiles/Ceramic",
+    "Surfaces/Tiles/Mosaic",
+    "Surfaces/Tiles/Stone Tiles",
+    "Surfaces/Tiles/Terracotta",
+    "Surfaces/Ground",
+    "Surfaces/Ground/Soil & Mud",
+    "Surfaces/Ground/Sand",
+    "Surfaces/Ground/Gravel",
+    "Surfaces/Ground/Grass",
+    "Surfaces/Ground/Moss",
+    "Surfaces/Ground/Forest Floor",
+    "Surfaces/Ground/Snow & Ice",
+    "Surfaces/Fabric",
+    "Surfaces/Fabric/Plain",
+    "Surfaces/Fabric/Patterned",
+    "Surfaces/Fabric/Knit & Wool",
+    "Surfaces/Fabric/Carpet & Rug",
+    "Surfaces/Leather",
+    "Surfaces/Leather/Smooth",
+    "Surfaces/Leather/Worn & Suede",
+    "Surfaces/Roads & Paving",
+    "Surfaces/Roads & Paving/Asphalt",
+    "Surfaces/Roads & Paving/Paving Stones",
+    "Surfaces/Roads & Paving/Concrete Paving",
+    "Surfaces/Roofing",
+    "Surfaces/Roofing/Shingles & Tiles",
+    "Surfaces/Roofing/Metal Roofing",
+    "Surfaces/Roofing/Thatch",
+    "Surfaces/Synthetic",
+    "Surfaces/Synthetic/Plastic",
+    "Surfaces/Synthetic/Rubber",
+    "Surfaces/Synthetic/Paper & Cardboard",
+    "Surfaces/Synthetic/Rope & Wicker",
+    "Surfaces/Custom",
+
+    "Props",
+    "Props/Furniture",
+    "Props/Furniture/Seating",
+    "Props/Furniture/Tables & Desks",
+    "Props/Furniture/Storage",
+    "Props/Furniture/Beds",
+    "Props/Lighting",
+    "Props/Lighting/Ceiling",
+    "Props/Lighting/Wall",
+    "Props/Lighting/Floor & Table",
+    "Props/Lighting/Outdoor",
+    "Props/Decor",
+    "Props/Decor/Vases & Pottery",
+    "Props/Decor/Frames & Art",
+    "Props/Decor/Books & Stationery",
+    "Props/Decor/Soft Decor",
+    "Props/Decor/Potted Plants",
+    "Props/Kitchen & Tableware",
+    "Props/Kitchen & Tableware/Cookware",
+    "Props/Kitchen & Tableware/Tableware",
+    "Props/Kitchen & Tableware/Appliances",
+    "Props/Kitchen & Tableware/Containers",
+    "Props/Electronics",
+    "Props/Electronics/Computers & Displays",
+    "Props/Electronics/Audio & Video",
+    "Props/Electronics/Household",
+    "Props/Tools & Hardware",
+    "Props/Tools & Hardware/Hand Tools",
+    "Props/Tools & Hardware/Power Tools",
+    "Props/Tools & Hardware/Hardware & Parts",
+    "Props/Food",
+    "Props/Food/Fruits & Vegetables",
+    "Props/Food/Baked & Packaged",
+    "Props/Food/Drinks",
+    "Props/Outdoor & Street",
+    "Props/Outdoor & Street/Street Furniture",
+    "Props/Outdoor & Street/Signage",
+    "Props/Outdoor & Street/Garden",
+    "Props/Outdoor & Street/Construction",
+    "Props/Industrial",
+    "Props/Industrial/Machinery",
+    "Props/Industrial/Pipes & Ducts",
+    "Props/Industrial/Crates & Barrels",
+    "Props/Misc",
+
+    "Nature",
+    "Nature/Trees",
+    "Nature/Bushes & Shrubs",
+    "Nature/Grass & Flowers",
+    "Nature/Rocks & Boulders",
+    "Nature/Cliffs & Formations",
+    "Nature/Debris",
+
+    "Architecture",
+    "Architecture/Doors",
+    "Architecture/Windows",
+    "Architecture/Walls & Panels",
+    "Architecture/Trim & Molding",
+    "Architecture/Stairs",
+    "Architecture/Railings & Fences",
+    "Architecture/Columns & Beams",
+    "Architecture/Modular Kits",
+
+    "Utility",
+    "Utility/Decals",
+    "Utility/Decals/Dirt & Leaks",
+    "Utility/Decals/Damage & Cracks",
+    "Utility/Decals/Graffiti & Posters",
+    "Utility/Decals/Road Markings",
+    "Utility/Imperfections",
+    "Utility/Noise & Patterns",
+    "Utility/Gradients & LUTs",
+    "Utility/Test & Calibration",
+)
+
 
 # ---------------------------------------------------------------------------
 # collections.json I/O
@@ -251,6 +405,22 @@ def ensure_paths(paths, dry_run=False):
     if created and not dry_run:
         save(doc)
     return {"ids": ids, "created": created}
+
+
+def seed_default_tree():
+    """Plant DEFAULT_TREE in a library that has never had a collection.
+
+    Guarded on the FILE, not on the tree being empty: a user who deleted every
+    collection on purpose has a collections.json saying so, and re-seeding it
+    behind their back would make the delete undoable only by deleting twice.
+
+    Idempotent and cheap - one read, one write, and nothing at all on the
+    second call. Returns how many nodes were planted (0 = already had a
+    tree)."""
+    if os.path.exists(config.COLLECTIONS_FILE):
+        return {"ok": True, "seeded": False, "created": 0}
+    result = ensure_paths(DEFAULT_TREE)
+    return {"ok": True, "seeded": True, "created": len(result["created"])}
 
 
 def rename(cid, name):

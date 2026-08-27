@@ -98,21 +98,33 @@ def library_status():
 
 @_json_api
 def init_library():
-    """Create the library skeleton (folders + empty index) at the current
-    root, so a brand-new install is usable immediately (SPEC F5, 2026-07-14).
-    Idempotent - a root that already holds a library is adopted, not reset.
-    Call after config.json was written with the chosen root.
+    """Create the library skeleton (folders, empty index, starting collection
+    tree) at the current root, so a brand-new install is usable immediately
+    (SPEC F5, 2026-07-14). Idempotent - a root that already holds a library is
+    adopted, not reset. Call after config.json was written with the chosen
+    root.
 
     A failure here leaves a new user with no library and no way to guess why,
     so the reason is spelled out rather than left as the repr-mangled path
-    str(OSError) produces (2026-08-23)."""
+    str(OSError) produces (2026-08-23).
+
+    Seeding shares that one failure path on purpose: a root Kura just created
+    but cannot write collections.json into is broken for the same reason
+    (permissions, full disk) and says so once, rather than reporting a library
+    that is fine and a tree that quietly is not."""
     try:
         store.ensure_library_dirs()
         entries = library.rebuild_index()
+        # Only a genuinely new library is seeded (2026-08-27). "Use This
+        # Folder" also lands here, and planting a hundred-odd collections into
+        # a root that already holds someone's assets would be filing THEIR
+        # library for them.
+        seeded = catalog.seed_default_tree()["created"] if entries == 0 else 0
     except OSError as e:
         raise RuntimeError("Could not create the library at %s: %s"
                            % (config.LIBRARY_ROOT, e.strerror or e))
-    return {"ok": True, "root": config.LIBRARY_ROOT, "entries": entries}
+    return {"ok": True, "root": config.LIBRARY_ROOT, "entries": entries,
+            "collections": seeded}
 
 
 @_json_api
