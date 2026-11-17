@@ -176,7 +176,11 @@ def export_package(packages, out_path, name="", description="", author="",
     tmp = out_path + ".kura-staging"
     try:
         os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+        # strict_timestamps=False: a file dated before 1980 (zip's epoch) -
+        # common after extracting some archives - is stored as 1980 instead
+        # of raising ValueError and blocking the whole export (2026-11-04).
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED,
+                             strict_timestamps=False) as z:
             z.writestr(MANIFEST_NAME,
                        json.dumps(manifest, ensure_ascii=False, indent=2))
             for idx, m in enumerate(metas, 1):
@@ -203,7 +207,10 @@ def export_package(packages, out_path, name="", description="", author="",
                 if os.path.isfile(thumb):
                     z.write(thumb, _thumb_name(rel))
         os.replace(tmp, out_path)
-    except OSError as e:
+    except Exception as e:  # noqa: BLE001 - the half-written file must go
+        # Broader than OSError for the same reason as commit()'s staging: any
+        # other exception escaping here left a *.kura-staging next to the
+        # user's chosen path (2026-11-04).
         try:
             os.remove(tmp)
         except OSError:
@@ -253,12 +260,26 @@ def _tree_paths(block):
     """Collection paths a manifest's "collections" block ships, ancestors
     first. Tolerates a hand-edited manifest: anything unusable is dropped."""
     out = []
-    for entry in (block or {}).get("tree") or []:
+    tree = (block or {}).get("tree")
+    for entry in tree if isinstance(tree, list) else []:
         if isinstance(entry, dict):
             path = str(entry.get("path", "")).strip()
             if path and path not in out:
                 out.append(path)
     return out
+
+
+def _members(block):
+    """{package: [path, ...]} from a manifest's "collections" block, with
+    anything that is not that shape dropped - the block is untrusted input
+    read AFTER the files are in place, so a malformed one must cost the
+    filing, never the import. A bare string is refused rather than iterated,
+    which would plant one collection per character."""
+    raw = (block or {}).get("members")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(pkg): [str(p).strip() for p in paths if str(p).strip()]
+            for pkg, paths in raw.items() if isinstance(paths, list)}
 
 
 def _collections_summary(block):
@@ -270,7 +291,7 @@ def _collections_summary(block):
         return {"total": 0, "new": 0, "entries": 0}
     return {"total": len(paths),
             "new": len(catalog.ensure_paths(paths, dry_run=True)["created"]),
-            "entries": len((block or {}).get("members") or {})}
+            "entries": len(_members(block))}
 
 
 def preview(pack_path, current_engine=None, force_version=False, progress=None):
@@ -385,20 +406,40 @@ def _cleanup_staged(staged):
             store._prune_empty_dirs(d, config.META_DIR)
 
 
-def _stage_meta(z, arc, tmp):
-    """Write an incoming meta into staging with the recipient's own filing
-    reset (SPEC F7 import step 5).
+def _stage_meta(z, arc, tmp, pkg, sha256):
+    """Write an incoming meta into staging with the exporter's filing
+    dropped and the recipient's own kept (SPEC F7 import step 5).
 
     Collection ids name collections in the EXPORTER's Meta/collections.json,
     which does not travel, so the incoming ids are always dropped (SPEC F8).
-    The filing itself is rebuilt afterwards from the manifest's path-keyed
-    "collections" block, by _file_imported, once the entries are in place -
-    so an entry is briefly Unsorted between staging and filing, and stays
-    that way if the user picked "None (Unsorted)". Everything else rides
-    along untouched - tags, notes and is_root describe the asset."""
+    What takes their place is the recipient's filing of the entry this
+    updates, if any: an update brings a new version, not a reason to unfile
+    it - until 2026-10-07 it came out Unsorted, while an identical entry
+    (never restaged) kept its collections. The package's own filing is added
+    on top afterwards from the manifest's path-keyed "collections" block, by
+    _file_imported, once the entries are in place - so a new entry is
+    briefly Unsorted between staging and filing, and stays that way if the
+    user picked "None (Unsorted)". Everything else rides along untouched -
+    tags, notes and is_root describe the asset.
+
+    The meta must describe the entry it ships with: its "package" is what
+    every later write derives the meta's path from (store.save_meta), and its
+    "sha256" is what Verify Library checks the file against. Both were taken
+    on trust until 2026-11-04, so a crafted package could pass _safe_rel on
+    the manifest and still name a different - even a "../" - package inside
+    the meta. A mismatch fails staging like a bad hash does."""
     with z.open(arc) as src:
         meta = json.loads(src.read().decode("utf-8"))
-    meta["collections"] = []
+    if not isinstance(meta, dict):
+        raise ValueError("%s: the meta in the package is not an object" % pkg)
+    if meta.get("package") != pkg:
+        raise ValueError("%s: the meta in the package describes %r instead"
+                         % (pkg, meta.get("package")))
+    if meta.get("sha256") != sha256:
+        raise ValueError("%s: the meta in the package disagrees with the "
+                         "manifest about the file's hash" % pkg)
+    local = store.load_meta(pkg)
+    meta["collections"] = list((local or {}).get("collections") or [])
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
@@ -433,11 +474,10 @@ def _file_imported(packages, choice, block):
             return out
 
         wanted = {}  # collection path -> [package, ...]
+        members = _members(block)
         for pkg in sorted(metas):
-            for path in ((block or {}).get("members") or {}).get(pkg) or []:
-                path = str(path).strip()
-                if path:
-                    wanted.setdefault(path, []).append(pkg)
+            for path in members.get(pkg, []):
+                wanted.setdefault(path, []).append(pkg)
         if not wanted:
             return out
         # Create the shipped branch set in one pass, ancestors first, so
@@ -460,7 +500,7 @@ def _file_imported(packages, choice, block):
                 catalog.assign(pkgs, cid, add=True)
                 filed += pkgs
         out["filed"] = sorted(set(filed))
-    except (OSError, ValueError, RuntimeError) as e:
+    except Exception as e:  # noqa: BLE001 - see "Never raises" above
         out["error"] = str(e)
     return out
 
@@ -471,17 +511,19 @@ def commit(pack_path, decisions=None, current_engine=None, force_version=False,
 
     decisions: {package: "update" | "keep"} for every conflict item.
     collection: where the imported entries get filed - PACK_COLLECTIONS,
-    "" (Unsorted), or an existing collection id. Filing runs last, after
-    rebuild_index(), because it is a meta write plus an index update; it
+    "" (Unsorted), or an existing collection id. Filing runs last, after the
+    index update, because it is a meta write plus an index update; it
     covers everything except entries the user explicitly chose to Ignore
     (status "same" included, so re-importing a package fixes filing that
     predates this feature), and it never fails the import.
     "update" archives the current library version first (restorable from
     Recently Deleted); the package's meta then replaces the old meta wholesale
-    - meta travels as-is, so local tag edits live on in the archived copy.
+    - meta travels as-is, so local tag edits live on in the archived copy -
+    except the filing, which is the recipient's and stays (_stage_meta).
     Every staged .uasset is hash-verified against the manifest before anything
     is placed, so a corrupted download aborts with the library untouched.
-    Returns {"ok", "errors", "added", "updated", "skipped"}.
+    Returns {"ok", "errors", "added", "updated", "skipped"}, plus
+    "collections" (see _file_imported) when the import went through.
     """
     decisions = dict(decisions or {})
     p = preview(pack_path, current_engine=current_engine,
@@ -529,28 +571,32 @@ def commit(pack_path, decisions=None, current_engine=None, force_version=False,
                 if progress is not None:
                     progress(idx, len(plan), pkg)
                 rel = _safe_rel(pkg)  # defense in depth; preview validated too
-                files = []
-                meta_arc = _meta_name(rel)
-                for arc, final in ((_tree_name(rel), store.tree_file(pkg)),
-                                   (meta_arc, store.meta_file(pkg)),
-                                   (_thumb_name(rel), store.thumb_file(pkg))):
-                    if arc not in names:
-                        continue  # thumbnails are optional; rest checked in preview
-                    os.makedirs(os.path.dirname(final), exist_ok=True)
-                    tmp = final + ".kura-staging"
-                    if arc == meta_arc:
-                        _stage_meta(z, arc, tmp)
-                    else:
-                        with z.open(arc) as src, open(tmp, "wb") as dst:
-                            shutil.copyfileobj(src, dst, 1 << 20)
-                    files.append((tmp, final))
-                if not files:
-                    # preview() checked the tree file is in the zip; getting
-                    # here means the file changed underneath us.
+                tree_arc, meta_arc = _tree_name(rel), _meta_name(rel)
+                if tree_arc not in names or meta_arc not in names:
+                    # preview() checked both are in the zip; getting here
+                    # means the file changed underneath us.
                     raise ValueError(
                         "%s is missing from the package - it changed while "
                         "the import was running" % pkg)
+                # Registered for cleanup BEFORE anything is written: this
+                # item's own files must go too when one of them fails - a
+                # corrupt meta used to leave the .uasset copy staged before
+                # it behind (2026-11-04; R2 had covered earlier items only).
+                files = []
                 staged.append((item, files))
+                for arc, final in ((tree_arc, store.tree_file(pkg)),
+                                   (meta_arc, store.meta_file(pkg)),
+                                   (_thumb_name(rel), store.thumb_file(pkg))):
+                    if arc not in names:
+                        continue  # thumbnails are optional
+                    os.makedirs(os.path.dirname(final), exist_ok=True)
+                    tmp = final + ".kura-staging"
+                    files.append((tmp, final))
+                    if arc == meta_arc:
+                        _stage_meta(z, arc, tmp, pkg, item["sha256"])
+                    else:
+                        with z.open(arc) as src, open(tmp, "wb") as dst:
+                            shutil.copyfileobj(src, dst, 1 << 20)
                 tree_tmp = files[0][0]
                 if store.sha256_of(tree_tmp) != item["sha256"]:
                     raise OSError(

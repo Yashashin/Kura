@@ -10,8 +10,15 @@
 #include "KuraLibraryModel.h"
 #include "KuraPython.h"
 #include "KuraStyle.h"
+#include "Misc/EngineVersionComparison.h"
 #include "Misc/MessageDialog.h"
-#include "SSearchableComboBox.h"
+#if UE_VERSION_OLDER_THAN(5, 8, 0)
+#include "SSearchableComboBox.h" // ToolWidgets
+#else
+// 5.8 moved the widget into Slate; the ToolWidgets header still forwards there
+// but is deprecated (C4996) and goes away in the next release.
+#include "Widgets/Input/SSearchableComboBox.h"
+#endif
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SButton.h"
@@ -32,6 +39,39 @@
 
 namespace
 {
+	/** Config key the ingest collection picker remembers its last choice
+	 *  under - one per class tab, so the collection a batch of materials just
+	 *  went into is not what the PCG graph sent next gets filed under
+	 *  (2026-10-08). Keyed by the roots the user picked; a batch whose picks
+	 *  span tabs keeps the shared key, as every batch did before. A tab that
+	 *  has never been used starts at None - falling back to the shared key
+	 *  would bring the old cross-class choice straight back. */
+	FString IngestCollectionKey(const TArray<TSharedPtr<FKuraPreviewRow>>& Rows)
+	{
+		const FString Shared = TEXT("ingest_collection");
+		int32 Tab = INDEX_NONE;
+		for (const TSharedPtr<FKuraPreviewRow>& Row : Rows)
+		{
+			if (!Row->bSelected)
+			{
+				continue;
+			}
+			const int32 RowTab = KuraLibrary::TabIndexForClass(Row->Class);
+			if (Tab != INDEX_NONE && RowTab != Tab)
+			{
+				return Shared;
+			}
+			Tab = RowTab;
+		}
+		if (Tab == INDEX_NONE || KuraLibrary::IsAllTab(Tab))
+		{
+			return Shared;
+		}
+		// "Static Meshes" -> ingest_collection.static_meshes
+		return Shared + TEXT(".")
+			+ FString(KuraLibrary::ClassTabs[Tab].Label).ToLower().Replace(TEXT(" "), TEXT("_"));
+	}
+
 	/** A conflict resolution choice: the wire key sent to Python (stable) and
 	 *  the label shown to the user (Title Case). Kept separate so we can
 	 *  reword the UI without touching the Python protocol. */
@@ -1337,12 +1377,13 @@ void KuraActions::RunIngestFlow(TSharedPtr<const SWidget> ModalParent)
 	TSharedPtr<bool> DepsAsRoots = MakeShared<bool>(
 		KuraLibrary::GetConfigNumber(TEXT("ingest_deps_as_roots"), 0.0) != 0.0);
 	TSharedPtr<FString> BatchTags = MakeShared<FString>();
-	// Remembered like the deps checkbox: filling a collection usually takes
-	// several uploads in a row (SPEC F8).
-	TSharedPtr<FString> CollectionId = MakeShared<FString>(
-		KuraLibrary::GetConfigString(TEXT("ingest_collection")));
 
 	const TArray<TSharedPtr<FKuraPreviewRow>> Rows = RowsFromPreview(Preview, TEXT("keep"));
+	// Remembered like the deps checkbox: filling a collection usually takes
+	// several uploads in a row (SPEC F8) - per class, see IngestCollectionKey.
+	const FString CollectionKey = IngestCollectionKey(Rows);
+	TSharedPtr<FString> CollectionId = MakeShared<FString>(
+		KuraLibrary::GetConfigString(*CollectionKey));
 	ShowPreviewDialog(
 		LOCTEXT("IngestPreviewTitle", "Send to Kura - Upload Preview"),
 		LOCTEXT("IngestWarning", "Update: the current library version is moved to _archive, then replaced by the version you are sending. Ignore: this asset is not uploaded and the library keeps its current version."),
@@ -1353,9 +1394,9 @@ void KuraActions::RunIngestFlow(TSharedPtr<const SWidget> ModalParent)
 		BatchTags,
 		FKuraCollectionPicker{ CollectionId },
 		ModalParent,
-		[ModalParent, Roots, DepsAsRoots, BatchTags, CollectionId](const TMap<FString, FString>& Decisions)
+		[ModalParent, Roots, DepsAsRoots, BatchTags, CollectionId, CollectionKey](const TMap<FString, FString>& Decisions)
 		{
-			KuraLibrary::SaveConfig({ { TEXT("ingest_collection"), *CollectionId } },
+			KuraLibrary::SaveConfig({ { CollectionKey, *CollectionId } },
 				{ { TEXT("ingest_deps_as_roots"), *DepsAsRoots ? 1.0 : 0.0 } });
 			const FString Statement = FString::Printf(TEXT("ingest_commit('%s', '%s', %s, '%s', '%s')"),
 				*KuraPython::EscapePyStr(KuraPython::ToJsonArray(Roots)),
@@ -1377,6 +1418,18 @@ void KuraActions::RunIngestFlow(TSharedPtr<const SWidget> ModalParent)
 			else
 			{
 				Notify(true, LOCTEXT("IngestDone", "Kura: ingest finished"));
+				FString FilingError;
+				if (Result->TryGetStringField(TEXT("filing_error"), FilingError)
+					&& !FilingError.IsEmpty())
+				{
+					// The assets are in; only the filing tripped, so this is
+					// a warning next to a successful upload - same shape as
+					// the .kurapack import's collections.error.
+					Notify(false, FText::Format(
+						LOCTEXT("IngestFilingFailed",
+							"Kura: assets uploaded, but adding them to the collection failed - {0}"),
+						FText::FromString(FilingError)));
+				}
 			}
 			OnLibraryChanged().Broadcast();
 		});
@@ -2005,6 +2058,19 @@ void KuraActions::RunArchiveFlow(TSharedPtr<const SWidget> ModalParent)
 					Entries.Add(E->AsString());
 				}
 			}
+			// Meta / thumbnails archived without their asset file. A batch
+			// holding only those used to read "0 entries" next to a size.
+			double Orphans = 0.0;
+			Batch->TryGetNumberField(TEXT("orphans"), Orphans);
+			const FText BatchInfo = Orphans > 0.0
+				? FText::Format(LOCTEXT("BatchInfoOrphans",
+					"{0} {0}|plural(one=entry,other=entries), {1} metadata-only (no asset file to restore)  -  {2}"),
+					Entries.Num(), static_cast<int32>(Orphans),
+					FText::FromString(FormatBytes(Bytes)))
+				: FText::Format(LOCTEXT("BatchInfo",
+					"{0} {0}|plural(one=entry,other=entries)  -  {1}"),
+					FText::AsNumber(Entries.Num()),
+					FText::FromString(FormatBytes(Bytes)));
 
 			ListBox->AddSlot().AutoHeight().Padding(0.f, 2.f)
 			[
@@ -2026,10 +2092,7 @@ void KuraActions::RunArchiveFlow(TSharedPtr<const SWidget> ModalParent)
 						+ SVerticalBox::Slot().AutoHeight()
 						[
 							SNew(STextBlock)
-							.Text(FText::Format(LOCTEXT("BatchInfo",
-								"{0} {0}|plural(one=entry,other=entries)  -  {1}"),
-								FText::AsNumber(Entries.Num()),
-								FText::FromString(FormatBytes(Bytes))))
+							.Text(BatchInfo)
 							.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
 							.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 						]
@@ -2452,6 +2515,8 @@ void KuraActions::RunRescanFlow(TSharedPtr<const SWidget> ModalParent)
 			}
 		}
 	};
+	AddList(TEXT("unreadable"),
+		TEXT("Damaged metadata - hidden from the panel; send the asset to Kura again or restore the .json from a backup"));
 	AddList(TEXT("unregistered"), TEXT("Files without meta"));
 	AddList(TEXT("missing"), TEXT("Meta without file"));
 	AddList(TEXT("modified"), TEXT("Externally modified"));

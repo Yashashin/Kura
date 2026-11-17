@@ -253,8 +253,12 @@ FString KuraLibrary::GetTreeDir()
 }
 
 TArray<TSharedPtr<FKuraEntry>> KuraLibrary::LoadEntries(
-	const TArray<TSharedPtr<FKuraEntry>>* Previous)
+	const TArray<TSharedPtr<FKuraEntry>>* Previous, int32* OutUnreadable)
 {
+	if (OutUnreadable)
+	{
+		*OutUnreadable = 0;
+	}
 	TArray<TSharedPtr<FKuraEntry>> Out;
 	const FString MetaDir = GetLibraryRoot() / TEXT("Meta");
 	const FString Prefix = GetLibPrefix() + TEXT("/");
@@ -315,7 +319,14 @@ TArray<TSharedPtr<FKuraEntry>> KuraLibrary::LoadEntries(
 		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
 		if (!FJsonSerializer::Deserialize(Reader, M) || !M.IsValid())
 		{
+			// Truncated by a crash or a full disk. The asset is still in the
+			// library but cannot be shown; counted so the panel can say so
+			// instead of letting it vanish without a word (D1, 2026-11-17).
 			UE_LOG(LogKura, Warning, TEXT("Failed to parse meta %s"), *File);
+			if (OutUnreadable)
+			{
+				++*OutUnreadable;
+			}
 			continue;
 		}
 
@@ -520,8 +531,12 @@ TArray<TSharedPtr<FKuraCollectionNode>> KuraLibrary::LoadCollectionTree(
 	// Direct membership counts; rolled up into ancestors after the tree is
 	// built. Kept split by class as well so each tab can show its own number
 	// and hide the collections it has nothing to say about (F2/F8).
-	TMap<FString, int32> DirectCounts;
-	TMap<FString, TMap<FString, int32>> DirectClassCounts;
+	//
+	// Members, not numbers: an entry filed in both a collection and one of
+	// its children is ONE entry of the parent, so the roll-up has to be a set
+	// union. Adding child counts up counted it twice, and disagreed with
+	// kura.catalog.list_tree() (2026-11-17).
+	TMap<FString, TArray<const FKuraEntry*>> DirectMembers;
 	TMap<FString, int32> UnsortedClassCounts;
 	TMap<FString, int32> SharedClassCounts;
 	int32 UnsortedCount = 0;
@@ -530,8 +545,7 @@ TArray<TSharedPtr<FKuraCollectionNode>> KuraLibrary::LoadCollectionTree(
 	{
 		for (const FString& Cid : E->Collections)
 		{
-			DirectCounts.FindOrAdd(Cid)++;
-			DirectClassCounts.FindOrAdd(Cid).FindOrAdd(E->Class)++;
+			DirectMembers.FindOrAdd(Cid).Add(E.Get());
 		}
 		if (E->bIsRoot && E->Collections.Num() == 0)
 		{
@@ -574,8 +588,6 @@ TArray<TSharedPtr<FKuraCollectionNode>> KuraLibrary::LoadCollectionTree(
 			const TSharedPtr<FKuraCollectionNode> Node = MakeShared<FKuraCollectionNode>();
 			Node->Id = Id;
 			Node->Name = Name;
-			Node->Count = DirectCounts.FindRef(Id);
-			Node->ClassCounts = DirectClassCounts.FindRef(Id);
 			ById.Add(Id, Node);
 			Parents.Emplace(Id, Parent);
 			Order.Emplace(Id, (int32)SortOrder);
@@ -599,8 +611,12 @@ TArray<TSharedPtr<FKuraCollectionNode>> KuraLibrary::LoadCollectionTree(
 	{
 		OrderById.Add(Pair.Key, Pair.Value);
 	}
-	TFunction<void(TArray<TSharedPtr<FKuraCollectionNode>>&)> SortAndRollUp =
-		[&SortAndRollUp, &OrderById](TArray<TSharedPtr<FKuraCollectionNode>>& Nodes)
+	// Sorts a level and fills each node's counts from the union of its own
+	// members and everything filed below it; OutMembers receives that union
+	// for the level as a whole, which is what the parent needs.
+	TFunction<void(TArray<TSharedPtr<FKuraCollectionNode>>&, TSet<const FKuraEntry*>&)> SortAndRollUp =
+		[&SortAndRollUp, &OrderById, &DirectMembers](
+			TArray<TSharedPtr<FKuraCollectionNode>>& Nodes, TSet<const FKuraEntry*>& OutMembers)
 	{
 		Nodes.Sort([&OrderById](const TSharedPtr<FKuraCollectionNode>& A,
 			const TSharedPtr<FKuraCollectionNode>& B)
@@ -611,20 +627,25 @@ TArray<TSharedPtr<FKuraCollectionNode>> KuraLibrary::LoadCollectionTree(
 		});
 		for (const TSharedPtr<FKuraCollectionNode>& Node : Nodes)
 		{
-			SortAndRollUp(Node->Children);
 			// Show what clicking the node will actually list, which includes
 			// what is filed in its children (kura.catalog.members).
-			for (const TSharedPtr<FKuraCollectionNode>& Child : Node->Children)
+			TSet<const FKuraEntry*> Members;
+			SortAndRollUp(Node->Children, Members);
+			if (const TArray<const FKuraEntry*>* Direct = DirectMembers.Find(Node->Id))
 			{
-				Node->Count += Child->Count;
-				for (const TPair<FString, int32>& Pair : Child->ClassCounts)
-				{
-					Node->ClassCounts.FindOrAdd(Pair.Key) += Pair.Value;
-				}
+				Members.Append(*Direct);
 			}
+			Node->Count = Members.Num();
+			Node->ClassCounts.Reset();
+			for (const FKuraEntry* Member : Members)
+			{
+				Node->ClassCounts.FindOrAdd(Member->Class)++;
+			}
+			OutMembers.Append(Members);
 		}
 	};
-	SortAndRollUp(Roots);
+	TSet<const FKuraEntry*> AllFiled;
+	SortAndRollUp(Roots, AllFiled);
 
 	if (UnsortedCount > 0)
 	{

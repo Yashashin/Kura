@@ -84,6 +84,7 @@ private:
 	 *  which then failed with a message about a folder that never existed. */
 	bool bLibraryConfigured = true;
 	bool bLibraryRootMissing = false; // configured root gone from disk (2e step 2)
+	int32 UnreadableMetaNotified = 0; // damaged-meta count last announced
 	bool bIncludeSubfolders = true;
 	float TileSize = 150.f;        // config tile_size; slider writes it back
 	int32 SortMode = 0;            // sort key: 0 = Name, 1 = Date Added, 2 = Size (config sort_mode)

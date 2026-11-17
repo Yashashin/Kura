@@ -48,6 +48,7 @@ Every library asset keeps one stable path — `/Game/_AssetLib/...` — identica
 - **Safe deletes** — nothing is hard-deleted: entries go to a restorable archive, and dependencies nothing else uses can be swept in the same batch or later.
 - **`.kurapack` packages** — export any selection or folder, dependency closure included, as one file another Kura library can import.
 - **Portable data layer** — per-asset JSON and thumbnails on disk; the database is only a cache and rebuilds from them.
+- **PCG graphs** — PCG Graphs and Graph Instances are library entries with a tab of their own; subgraphs come along as dependencies and are stored once, like a master material. See [PCG graphs](#-pcg-graphs) for the one rule they follow.
 - **PBR Material Importer** — point it at a folder of PBR texture sets: textures imported with the right sRGB and compression settings, one Material Instance built per set. Current project only, nothing sent to the library.
 
 **Sending assets to the library** — right-click in the Content Browser, review what comes along, confirm.
@@ -79,7 +80,7 @@ Every library asset keeps one stable path — `/Game/_AssetLib/...` — identica
 
 A few things worth knowing early:
 
-- Library entries can be Static Meshes, Materials, Material Instances and Textures. Whatever they reference — material functions, curves, textures — comes along on its own.
+- Library entries can be Static Meshes, Materials, Material Instances, Textures and PCG Graphs. Whatever they reference — material functions, curves, textures, subgraphs — comes along on its own.
 - **Folders are storage; collections are organisation.** A library folder is also the asset's path, so it is fixed at upload time — **keep categories out of it**, since categories are exactly what you change your mind about. A layout that works: one folder per asset with its own textures, plus a `Shared/` folder for anything reused.
 - Never rename files inside the library folder by hand — that breaks references by definition. Rename in a project, re-upload, delete the old entry.
 
@@ -92,6 +93,16 @@ The result is one self-contained file — assets, metadata, tags and thumbnails 
 ### More assets!
 
 Kura ships empty, so I put my own material library up for anyone to take: **[2,680 CC0 materials across 33 packs](Docs/packs.md)** from [Poly Haven](https://polyhaven.com) and [ambientCG](https://ambientcg.com), plus the sample pack attached to every [release](https://github.com/Yashashin/Kura/releases). Import the sample pack first and every pack after it will skip the assets they share.
+
+## 🌲 PCG graphs
+
+A PCG Graph or Graph Instance goes into the library as **pure logic**: the graph and its subgraphs, with no meshes, materials or Blueprints attached.
+
+- **What comes along:** subgraphs and a Graph Instance's parent graph. PCG's built-in content (`/PCG/...`) and engine content are recorded but not copied — every project with PCG enabled already has them.
+- **What blocks an upload:** a graph that points at project content — a mesh set on a Static Mesh Spawner, a Graph Parameter with a default value, a parameter override on a subgraph node, a Spawn Actor pointing at a Blueprint. The message names the graph holding the reference, so one buried three subgraphs deep is still findable. Clear the reference, or expose it as a Graph Parameter with no default.
+- **How to use an imported graph:** create a Graph Instance of it in your project, *outside* `_AssetLib`, and set the meshes there through Graph Parameters. Editing the imported graph's Spawner nodes works too, but you are then editing your project's copy of the library version — importing that graph again, or another graph sharing one of its subgraphs, raises a conflict, and choosing the library version overwrites your settings.
+- **The PCG plugin has to be on** in the project you import into; otherwise the import is refused and tells you to enable it in **Edit → Plugins**. Kura itself does not need PCG and never enables it for you. Graphs using nodes from another plugin record that plugin and check for it the same way; graphs using custom nodes from a project's own C++ module cannot be uploaded.
+- PCG graphs have no thumbnail — tiles show a `PCG` / `PCGI` type block instead.
 
 ## 🛠️ Configuration
 
@@ -118,7 +129,7 @@ The panel keeps its own state in the same file. The first two are also in **Sett
 | `sort_mode` | `0` | 0 = Name, 1 = Date Added, 2 = Size |
 | `sort_ascending` | `1` | 1 = ascending (A-Z / oldest / smallest first), 0 = descending |
 | `ingest_deps_as_roots` | `0` | Remembers the "Mark Dependencies as Roots" checkbox |
-| `ingest_collection` | *(empty)* | Remembers the collection last picked in the upload preview |
+| `ingest_collection` | *(empty)* | Remembers the collection last picked in the upload preview. Uploads of a single kind keep their own (`ingest_collection.static_meshes`, `.materials`, …), so a mesh upload does not offer the collection you last filed textures into |
 | `collections_view` | `1` | 1 = left column shows Collections, 0 = Folders |
 
 ## 📂 Where Kura keeps things
@@ -152,8 +163,8 @@ Kura writes into your *project* only when you ask: **Import**, **Create _AssetLi
 ## ⚠️ Known limitations
 
 - **Windows only.** There is no macOS or Linux build.
-- **Uploadable types:** Static Mesh, Material, Material Instance, Texture (2D / Cube / Array). Skeletal Meshes, Blueprints, Niagara systems, levels and animation assets cannot be library entries. Dependency-only classes that a supported asset references (material functions, curves, …) come along fine and show up under the **All Assets** tab.
-- **Content from other plugins is blocked.** Only `/Game` (copied into the library) and `/Engine` (recorded in metadata, not copied) are supported. Anything depending on `/Fab/` or another plugin mount — Fab / Quixel Bridge content, plugins that ship content — is rejected with the offending references listed. Move what you need into `/Game` first.
+- **Uploadable types:** Static Mesh, Material, Material Instance, Texture (2D / Cube / Array), PCG Graph, PCG Graph Instance. Skeletal Meshes, Blueprints, Niagara systems, levels and animation assets cannot be library entries. Dependency-only classes that a supported asset references (material functions, curves, …) come along fine and show up under the **All Assets** tab.
+- **Content from other plugins is blocked.** Only `/Game` (copied into the library) and `/Engine` (recorded in metadata, not copied) are supported. Anything depending on `/Fab/` or another plugin mount — Fab / Quixel Bridge content, plugins that ship content — is rejected with the offending references listed. Move what you need into `/Game` first. The one exception is the PCG plugin's own content, which PCG graphs may reference.
 - **One library at a time.** Kura points at a single `library_root`; switching means changing the setting.
 - **No multi-user locking.** A library on a NAS or a synced folder can be shared, but Kura assumes a single writer — concurrent uploads from two machines are not protected against.
 - **Not version control.** `_archive` keeps whatever you overwrite or delete **in the library**, one batch per action. That is a safety net you can restore from, not a history you can navigate.

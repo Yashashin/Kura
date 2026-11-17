@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 2,
-	"VersionName": "1.1.0",
+	"Version": 3,
+	"VersionName": "1.2.0",
 	"FriendlyName": "Kura",
-	"Description": "Personal asset library for Unreal Engine: collect your meshes, materials and textures into one library, browse it with thumbnails and tags, and re-import assets with their dependencies into any project via stable /Game/_AssetLib paths. Includes a PBR texture-set importer and shareable .kurapack packages.",
+	"Description": "Personal asset library for Unreal Engine: collect your meshes, materials, textures and PCG graphs into one library, browse it with thumbnails and tags, and re-import assets with their dependencies into any project via stable /Game/_AssetLib paths. Includes a PBR texture-set importer and shareable .kurapack packages.",
 	"Category": "Editor",
 	"CreatedBy": "Yukio",
 	"CreatedByURL": "https://github.com/Yashashin",

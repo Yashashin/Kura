@@ -1,6 +1,8 @@
 """Dependency collection & classification (SPEC 7.1)."""
 import unreal
 
+from . import config
+
 
 def _registry():
     return unreal.AssetRegistryHelpers.get_asset_registry()
@@ -14,6 +16,24 @@ def _hard_only_options():
     opts.set_editor_property("include_soft_management_references", False)
     opts.set_editor_property("include_hard_management_references", False)
     return opts
+
+
+def _soft_only_options():
+    """Soft package references only (SPEC F9). Never followed when collecting -
+    a PCG graph is checked against them, so content it points at blocks the
+    upload instead of riding along."""
+    opts = _hard_only_options()
+    opts.set_editor_property("include_soft_package_references", True)
+    opts.set_editor_property("include_hard_package_references", False)
+    return opts
+
+
+def hard_dependencies(pkg):
+    return [str(d) for d in _registry().get_dependencies(pkg, _hard_only_options()) or []]
+
+
+def soft_dependencies(pkg):
+    return [str(d) for d in _registry().get_dependencies(pkg, _soft_only_options()) or []]
 
 
 def refresh_files(files):
@@ -36,6 +56,11 @@ def collect(root_packages):
     Returns {"game": [...], "engine": [...], "other": [...]} of package names
     (roots included). /Script/ class references are ignored; /Engine/ packages
     are recorded but not recursed into (they exist in every installation).
+
+    A PCG package's /PCG/ references count as engine ones (SPEC F9): that is
+    the PCG plugin's own content, and a PCG graph cannot be opened without the
+    plugin anyway. Decided per edge, so the same /PCG/ package reached from
+    anything else still lands in "other" and blocks.
     """
     ar = _registry()
     opts = _hard_only_options()
@@ -56,8 +81,16 @@ def collect(root_packages):
             other.add(pkg)
             continue
         game.add(pkg)
+        pcg = None  # looked up on the first /PCG/ edge only - nothing else pays
         for dep in ar.get_dependencies(pkg, opts) or []:
-            queue.append(str(dep))
+            dep = str(dep)
+            if dep.startswith(config.PCG_MOUNT):
+                if pcg is None:
+                    pcg = is_pcg_package(pkg)
+                if pcg:
+                    engine.add(dep)
+                    continue
+            queue.append(dep)
     return {"game": sorted(game), "engine": sorted(engine), "other": sorted(other)}
 
 
@@ -89,13 +122,26 @@ def _class_name(asset_data):
     return str(path.get_editor_property("asset_name"))
 
 
+def class_path(pkg):
+    """(module package, class name) of the primary asset in a package, e.g.
+    ('/Script/Engine', 'StaticMesh'); ('', 'Unknown') when there is none."""
+    for ad in _registry().get_assets_by_package_name(pkg) or []:
+        path = ad.get_editor_property("asset_class_path")
+        name = str(path.get_editor_property("asset_name"))
+        if name != "ObjectRedirector":
+            return str(path.get_editor_property("package_name")), name
+    return "", "Unknown"
+
+
 def primary_class(pkg):
     """Class name of the primary asset in a package (e.g. 'StaticMesh')."""
-    for ad in _registry().get_assets_by_package_name(pkg) or []:
-        cls = _class_name(ad)
-        if cls != "ObjectRedirector":
-            return cls
-    return "Unknown"
+    return class_path(pkg)[1]
+
+
+def is_pcg_package(pkg):
+    """Is the primary asset a PCG one - a graph, an instance, or anything else
+    of the PCG module (SPEC F9)?"""
+    return class_path(pkg)[0] == config.PCG_SCRIPT_PACKAGE
 
 
 def is_redirector(pkg):

@@ -16,8 +16,8 @@ import tempfile
 
 import unreal
 
-from . import (catalog, config, editor_api, importer, ingest, library, manage,
-               pack, store)
+from . import (catalog, config, deps, editor_api, importer, ingest, library,
+               manage, pack, pcg, store)
 
 TEX = config.LIB_PREFIX + "/Shared/Textures/T_KuraTest"
 MA = config.LIB_PREFIX + "/Shared/Master/M_A"
@@ -28,6 +28,19 @@ AB = config.LIB_PREFIX + "/KuraTest/Lamp/MI_AB"
 # (wrong type root), now the recommended layout (Q24).
 COLOCATED = config.LIB_PREFIX + "/KuraTest/Chair/T_ChairOnly"
 OUTSIDE = "/Game/TestAssets/T_Outside"
+
+# PCG graphs (SPEC F9): two graphs sharing one subgraph, an instance, and two
+# that must be refused - content two levels down, and a hard reference to a BP.
+PCG_SUB = config.LIB_PREFIX + "/Shared/PCG/PCGSG_Scatter"
+PCG_FOREST = config.LIB_PREFIX + "/KuraTest/PCG/Forest/PCG_Forest"
+PCG_ROCKS = config.LIB_PREFIX + "/KuraTest/PCG/Rocks/PCG_Rocks"
+PCG_ROCKS_I = config.LIB_PREFIX + "/KuraTest/PCG/Rocks/PCGI_Rocks"
+PCG_DIRTY_SUB = config.LIB_PREFIX + "/KuraTest/PCG/Dirty/PCGSG_Dirty"
+PCG_DIRTY = config.LIB_PREFIX + "/KuraTest/PCG/Dirty/PCG_Dirty"
+PCG_ACTOR = config.LIB_PREFIX + "/KuraTest/PCG/Actor/PCG_SpawnsActor"
+PCG_BP = config.LIB_PREFIX + "/KuraTest/PCG/Actor/BP_Spawned"
+PCG_BUILTIN = "/PCG/Subgraphs/ElevationIsolines"
+ENGINE_SPHERE = "/Engine/BasicShapes/Sphere"
 
 
 def _check(cond, msg):
@@ -110,6 +123,10 @@ def _run_seed_check():
 
 def _reset_library():
     """Archive every existing entry so the run starts from an empty tree."""
+    # The run may point at a library that does not exist yet. Create it the
+    # way first-run setup does - the index no longer makes the root on its
+    # own (2026-11-17).
+    store.ensure_library_dirs()
     packages = [m["package"] for m in store.iter_metas()]
     if packages:
         batch = store.archive(packages)
@@ -175,6 +192,147 @@ def _modify_master(two_sided):
     mat.set_editor_property("two_sided", two_sided)
     unreal.MaterialEditingLibrary.recompile_material(mat)
     _check(sub.save_asset(MA, False), "save modified M_A")
+
+
+def _new_pcg_graph(pkg):
+    folder, name = pkg.rsplit("/", 1)
+    graph = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+        name, folder, unreal.PCGGraph, unreal.PCGGraphFactory())
+    _check(graph, "create %s" % name)
+    return graph
+
+
+def _add_spawner(graph, meshes):
+    """A Static Mesh Spawner whose weighted entries point at the given meshes -
+    soft references, which is exactly what the clean rule is about."""
+    _node, settings = graph.add_node_of_type(unreal.PCGStaticMeshSpawnerSettings)
+    selector = settings.get_editor_property("mesh_selector_parameters")
+    entries = []
+    for mesh in meshes:
+        descriptor = unreal.PCGSoftISMComponentDescriptor()
+        descriptor.set_editor_property("static_mesh", mesh)
+        entry = unreal.PCGMeshSelectorWeightedEntry()
+        entry.set_editor_property("descriptor", descriptor)
+        entries.append(entry)
+    selector.set_editor_property("mesh_entries", entries)
+
+
+def _add_subgraph(graph, subgraph):
+    _node, settings = graph.add_node_of_type(unreal.PCGSubgraphSettings)
+    settings.get_editor_property("subgraph_instance").set_editor_property("graph", subgraph)
+
+
+def _make_pcg_assets():
+    sub = _asset_sub()
+    at = unreal.AssetToolsHelpers.get_asset_tools()
+    # Plugin content is not in a commandlet's registry until asked for - the
+    # fixture's own need, not something Kura's code paths ever do.
+    unreal.AssetRegistryHelpers.get_asset_registry().scan_paths_synchronous(
+        [PCG_BUILTIN.rsplit("/", 1)[0]], True)
+    builtin = sub.load_asset(PCG_BUILTIN)
+    _check(isinstance(builtin, unreal.PCGGraphInterface),
+           "built-in subgraph %s missing" % PCG_BUILTIN)
+
+    shared = _new_pcg_graph(PCG_SUB)
+    _add_spawner(shared, [])  # a spawner with no mesh set is the clean form
+
+    forest = _new_pcg_graph(PCG_FOREST)
+    _add_subgraph(forest, shared)
+    _add_subgraph(forest, builtin)
+    _add_spawner(forest, [sub.load_asset(ENGINE_SPHERE)])  # a placeholder
+
+    rocks = _new_pcg_graph(PCG_ROCKS)
+    _add_subgraph(rocks, shared)
+
+    folder, name = PCG_ROCKS_I.rsplit("/", 1)
+    instance = at.create_asset(name, folder, unreal.PCGGraphInstance,
+                               unreal.PCGGraphInstanceFactory())
+    _check(instance, "create %s" % name)
+    instance.set_editor_property("graph", rocks)
+
+    dirty_sub = _new_pcg_graph(PCG_DIRTY_SUB)
+    _add_spawner(dirty_sub, [sub.load_asset(SM)])
+    _add_subgraph(_new_pcg_graph(PCG_DIRTY), dirty_sub)
+
+    folder, name = PCG_BP.rsplit("/", 1)
+    factory = unreal.BlueprintFactory()
+    factory.set_editor_property("parent_class", unreal.Actor)
+    _check(at.create_asset(name, folder, unreal.Blueprint, factory), "create %s" % name)
+    _node, settings = _new_pcg_graph(PCG_ACTOR).add_node_of_type(
+        unreal.PCGSpawnActorSettings)
+    settings.set_editor_property(
+        "template_actor_class", unreal.EditorAssetLibrary.load_blueprint_class(PCG_BP))
+
+    for pkg in (PCG_SUB, PCG_FOREST, PCG_ROCKS, PCG_ROCKS_I, PCG_DIRTY_SUB,
+                PCG_DIRTY, PCG_BP, PCG_ACTOR):
+        _check(sub.save_asset(pkg, False), "save %s" % pkg)
+
+
+def _run_pcg_checks():
+    """PCG graphs (SPEC F9) on the host: the clean rule, subgraphs as shared
+    dependencies, /PCG/ and /Engine/ content recorded but never packed."""
+    _check(pcg.project_has(config.PCG_PLUGIN),
+           "the host project needs the PCG plugin enabled for the F9 checks")
+    _make_pcg_assets()
+
+    # A clean graph: its subgraph rides along, the built-in subgraph and the
+    # engine placeholder mesh are recorded and stay out of the library.
+    r = ingest.analyze([PCG_FOREST])
+    _check(r["ok"], "clean PCG graph must be accepted: %s" % r["errors"])
+    _check(_statuses(r) == {PCG_FOREST: "new", PCG_SUB: "new"},
+           "PCG closure must be the graph + its /Game subgraph only: %s"
+           % _statuses(r))
+    item = [i for i in r["items"] if i["package"] == PCG_FOREST][0]
+    _check(item["pcg"] and item["required_plugins"] == [config.PCG_PLUGIN],
+           "a PCG graph must need the PCG plugin: %s" % item)
+    r = ingest.commit([PCG_FOREST])
+    _check(r["ok"] and sorted(r["added"]) == sorted([PCG_FOREST, PCG_SUB]),
+           "PCG commit: %s" % r)
+    meta = store.load_meta(PCG_FOREST)
+    _check(meta["required_plugins"] == [config.PCG_PLUGIN],
+           "required_plugins must reach the meta: %s" % meta["required_plugins"])
+    _check(meta["hard_deps"] == [PCG_SUB], "hard_deps: %s" % meta["hard_deps"])
+    _check(PCG_BUILTIN in meta["engine_deps"] and ENGINE_SPHERE in meta["engine_deps"],
+           "/PCG/ and /Engine/ references must be recorded: %s" % meta["engine_deps"])
+
+    # A second graph on the same subgraph: one copy in the library.
+    r = ingest.commit([PCG_ROCKS])
+    _check(r["ok"] and r["added"] == [PCG_ROCKS] and r["skipped"] == [PCG_SUB],
+           "shared subgraph must be skipped the second time: %s" % r)
+    r = ingest.commit([PCG_ROCKS_I])
+    _check(r["ok"] and r["added"] == [PCG_ROCKS_I]
+           and sorted(r["skipped"]) == sorted([PCG_ROCKS, PCG_SUB]),
+           "an instance root must bring its parent graph: %s" % r)
+
+    # Content blocks - also when it sits in a subgraph, and the message names
+    # the package that holds it.
+    r = ingest.analyze([PCG_DIRTY])
+    _check(not r["ok"] and any(e.startswith(PCG_DIRTY_SUB) and SM in e
+                               and "soft" in e for e in r["errors"]),
+           "a mesh two levels down must block, naming the subgraph: %s"
+           % r["errors"])
+    r = ingest.analyze([PCG_ACTOR])
+    _check(not r["ok"] and any(e.startswith(PCG_ACTOR) and PCG_BP in e
+                               for e in r["errors"]),
+           "a hard reference to a Blueprint must block: %s" % r["errors"])
+
+    # Editing the shared subgraph conflicts and lists both graphs using it.
+    sub = _asset_sub()
+    sub.load_asset(PCG_SUB).add_node_of_type(unreal.PCGDensityFilterSettings)
+    _check(sub.save_asset(PCG_SUB, False), "save modified subgraph")
+    r = ingest.analyze([PCG_FOREST])
+    _check(r["ok"], "analyze after subgraph edit: %s" % r["errors"])
+    conflicts = {i["package"]: i for i in r["items"] if i["status"] == "conflict"}
+    _check(PCG_SUB in conflicts, "edited subgraph must conflict: %s" % _statuses(r))
+    _check(conflicts[PCG_SUB]["referrers"] == sorted([PCG_FOREST, PCG_ROCKS]),
+           "conflict must list both graphs: %s" % conflicts[PCG_SUB]["referrers"])
+    r = ingest.commit([PCG_FOREST], {p: "update" for p in conflicts})
+    _check(r["ok"] and PCG_SUB in r["updated"], "subgraph update: %s" % r)
+
+    incremental = _index_snapshot()
+    library.rebuild_index()
+    _check(incremental == _index_snapshot(),
+           "the index PCG ingests built incrementally must equal a full rebuild")
 
 
 def run_host_test():
@@ -288,6 +446,7 @@ def run_host_test():
 
     _run_collection_checks(furniture)
     _run_pack_collection_checks()
+    _run_update_keeps_filing_check()
 
     # Adopting a root that already holds assets must leave its filing alone
     # (2026-08-27) - "Use This Folder" on an existing library comes through
@@ -300,9 +459,10 @@ def run_host_test():
            "adopting must leave the collection tree exactly as it was")
 
     _run_reserved_name_check()
+    _run_pcg_checks()
 
-    unreal.log_warning("Kura selftest HOST PASS (5 entries, master unique, "
-                       "conflict flow + collections + pack filing verified)")
+    unreal.log_warning("Kura selftest HOST PASS (master unique, conflict flow "
+                       "+ collections + pack filing + PCG clean rule verified)")
 
 
 def _run_reserved_name_check():
@@ -457,6 +617,53 @@ def _run_pack_collection_checks():
     _check(catalog.list_tree()["collections"] == [], "tree should be empty again")
 
 
+def _run_update_keeps_filing_check():
+    """An update replaces an entry's version, never the user's filing
+    (2026-10-07). Both update paths rebuild the meta - ingest from scratch,
+    a package import from the package's copy - and both used to come out of
+    it Unsorted, while an identical re-send kept its collections.
+
+    Runs on M_A, a filed root here, and leaves the library version where the
+    target test expects it (two-sided), since that test edits M_A to
+    one-sided and needs that to conflict."""
+    keep = catalog.create("KeepMe")["id"]
+    catalog.assign([MA], keep)
+    tmp = tempfile.mkdtemp(prefix="kura_selftest_filing_")
+    try:
+        # A package holding the CURRENT library M_A, to update back to later.
+        out = os.path.join(tmp, "master.kurapack")
+        _check(pack.export_package([MA], out, name="Master")["ok"], "export M_A")
+
+        _modify_master(False)
+        r = ingest.commit([MA], {MA: "update"})
+        _check(r["ok"] and r["updated"] == [MA], "M_A ingest update: %s" % r)
+        _check(store.load_meta(MA)["collections"] == [keep],
+               "an ingest update must keep the entry's collections: %s"
+               % store.load_meta(MA)["collections"])
+        _check(library.collection_counts().get(keep) == 1,
+               "the index must still count the updated entry as filed")
+
+        # "None (Unsorted)" on purpose: the package's own filing would put
+        # M_A back into KeepMe by path and hide a dropped membership.
+        r = pack.commit(out, {MA: "update"}, current_engine=ingest.engine_version(),
+                        collection="")
+        _check(r["ok"] and r["updated"] == [MA], "M_A package update: %s" % r)
+        _check(store.load_meta(MA)["collections"] == [keep],
+               "a package update must keep the entry's local collections: %s"
+               % store.load_meta(MA)["collections"])
+        _check(library.collection_counts().get(keep) == 1,
+               "the index must still count the package-updated entry as filed")
+
+        incremental = _index_snapshot()
+        library.rebuild_index()
+        _check(incremental == _index_snapshot(),
+               "the index both updates built incrementally must equal a full rebuild")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    catalog.delete(keep)
+    _check(catalog.list_tree()["collections"] == [], "tree should be empty again")
+
+
 def run_target_test():
     """Import side (F3) in the target project."""
     sub = _asset_sub()
@@ -513,5 +720,37 @@ def run_target_test():
     _check(store.sha256_of(ingest.package_to_file(MA))
            == store.load_meta(MA)["sha256"], "overwrite must restore library M_A")
 
+    pcg_result = _run_pcg_import_checks()
     unreal.log_warning("Kura selftest TARGET PASS (round-trip intact, master "
-                       "unique, conflict flow verified)")
+                       "unique, conflict flow verified; %s)" % pcg_result)
+
+
+def _run_pcg_import_checks():
+    """PCG import (SPEC F9). Both outcomes are tested, one per run: without
+    the PCG plugin the import must refuse and copy nothing, with it the graph
+    and its shared subgraph arrive linked. Returns the PASS-line label."""
+    sub = _asset_sub()
+    if not pcg.project_has(config.PCG_PLUGIN):
+        p = importer.preview([PCG_FOREST])
+        _check(not p["ok"] and any("PCG plugin is not enabled" in e
+                                   for e in p["errors"]),
+               "import without PCG must be refused: %s" % p["errors"])
+        r = importer.commit([PCG_FOREST], force_version=True)
+        _check(not r["ok"] and not r["copied"],
+               "force must not get past the plugin check: %s" % r)
+        _check(not os.path.isfile(ingest.package_to_file(PCG_FOREST)),
+               "a refused import must copy nothing")
+        return "PCG off: import refused"
+
+    r = importer.commit([PCG_FOREST])
+    _check(r["ok"] and sorted(r["copied"]) == sorted([PCG_FOREST, PCG_SUB]),
+           "import PCG graph: %s" % r)
+    _check(isinstance(sub.load_asset(PCG_FOREST), unreal.PCGGraph),
+           "load PCG graph after import")
+    _check(PCG_SUB in deps.hard_dependencies(PCG_FOREST),
+           "imported graph must still point at its subgraph")
+    r = importer.commit([PCG_ROCKS_I])
+    _check(r["ok"] and sorted(r["copied"]) == sorted([PCG_ROCKS_I, PCG_ROCKS])
+           and r["skipped"] == [PCG_SUB],
+           "instance import must reuse the subgraph already here: %s" % r)
+    return "PCG on: graphs + shared subgraph imported"

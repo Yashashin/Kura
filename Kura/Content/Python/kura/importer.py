@@ -9,7 +9,7 @@ import shutil
 
 import unreal
 
-from . import deps, ingest, library, progress, store
+from . import deps, ingest, library, pcg, progress, store
 from .ingest import engine_version, package_to_file
 
 
@@ -35,6 +35,7 @@ def preview(packages, force_version=False):
         return {"ok": False, "errors": [str(e)], "items": []}
 
     cur = _version_tuple(engine_version())
+    needs = {}  # plugin -> entries that need it in this project (SPEC F9)
     items = []
     with progress.Reporter("Kura: checking the project against the library") as report:
         for idx, pkg in enumerate(closure, 1):
@@ -47,6 +48,8 @@ def preview(packages, force_version=False):
             if not os.path.isfile(src):
                 errors.append("Library file missing for %s (run Rescan Library)" % pkg)
                 continue
+            for plugin in pcg.plugins_needed(meta):
+                needs.setdefault(plugin, []).append(pkg)
             if _version_tuple(meta["engine_version"]) > cur and not force_version:
                 errors.append(
                     "%s was saved by UE %s but this editor is %s; a newer-engine "
@@ -68,6 +71,9 @@ def preview(packages, force_version=False):
                 "size": meta["size"],
                 "engine_version": meta["engine_version"],
             })
+    # Not part of the force escape hatch: an asset whose plugin is off cannot
+    # be opened at all, unlike one a little newer than this engine.
+    errors += pcg.missing_plugin_errors(needs)
     if errors:
         return {"ok": False, "errors": errors, "items": []}
     return {"ok": True, "errors": [], "items": items}

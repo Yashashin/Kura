@@ -209,10 +209,19 @@ def load():
             "id": cid,
             "name": name,
             "parent": str(raw.get("parent", "")).strip(),
-            "order": int(raw.get("order", 0) or 0),
+            "order": _order(raw.get("order")),
         })
     _reparent_orphans(items)
     return {"schema_version": CATALOG_SCHEMA_VERSION, "collections": items}
+
+
+def _order(value):
+    """Sort order of a hand-editable node; anything non-numeric reads as 0
+    rather than failing load() - and with it the whole tree (2026-11-04)."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def save(doc):
@@ -268,24 +277,32 @@ def list_tree():
     actually poses - "how much would selecting this show me" - and matches
     what members() / "Import this collection" would gather. Without the
     roll-up every branch of a deep tree reads 0, since assets are filed in
-    leaves (2026-08-13)."""
+    leaves (2026-08-13).
+
+    The roll-up is a union of member sets, not a sum of child counts: an
+    entry filed in two branches of one subtree is one asset to the parent,
+    as it is to members(). Until 2026-11-04 it was summed and counted twice
+    (the C++ panel's LoadCollectionTree still sums - see Docs/review_2026-11)."""
     items = load()["collections"]
-    counts = library.collection_counts()
+    memberships = library.collection_memberships()
+    unsorted = library.collection_counts().get("", 0)
     ordered = []
 
     def walk(parent, depth):
-        total = 0
+        under = set()
         for c in _children_of(items, parent):
             row = {"id": c["id"], "name": c["name"],
                    "parent": c["parent"], "order": c["order"],
-                   "depth": depth, "count": counts.get(c["id"], 0)}
+                   "depth": depth, "count": 0}
             ordered.append(row)
-            row["count"] += walk(c["id"], depth + 1)
-            total += row["count"]
-        return total
+            members = set(memberships.get(c["id"], ())) | walk(c["id"],
+                                                              depth + 1)
+            row["count"] = len(members)
+            under |= members
+        return under
 
     walk("", 0)
-    return {"ok": True, "collections": ordered, "unsorted": counts.get("", 0)}
+    return {"ok": True, "collections": ordered, "unsorted": unsorted}
 
 
 def path_of(cid, items=None):
@@ -469,28 +486,51 @@ def delete(cid):
     items = doc["collections"]
     _require(items, cid)
     doomed = set(_descendants(items, str(cid)))
+    # Every member meta is read and checked BEFORE the tree changes: one
+    # written by a newer Kura cannot be rewritten (SPEC 5.6), and finding
+    # that out halfway left the node gone but some members still filed under
+    # it (2026-11-04).
+    metas = _member_metas(doomed)
+    _refuse_newer(metas)
     doc["collections"] = [c for c in items if c["id"] not in doomed]
     save(doc)
-    unfiled = _strip_ids(doomed)
+    unfiled = _strip_ids(doomed, metas)
     return {"ok": True, "removed": sorted(doomed), "unfiled": unfiled}
 
 
-def _strip_ids(cids):
-    """Drop the given collection ids from every entry that carries one."""
-    touched = []
+def _member_metas(cids):
+    """Metas of every entry filed under any of the given ids, read once."""
+    metas = []
+    seen = set()
     for cid in cids:
         for pkg in library.packages_in_collection(cid):
-            if pkg not in touched:
-                touched.append(pkg)
-    for pkg in touched:
-        meta = store.load_meta(pkg)
-        if meta is None:
-            continue
-        kept = [c for c in meta.get("collections", []) if c not in cids]
-        meta["collections"] = kept
-        store.save_meta(meta)
-        library.update_entry(meta)
-    return sorted(touched)
+            if pkg in seen:
+                continue
+            seen.add(pkg)
+            meta = store.load_meta(pkg)
+            if meta is not None:
+                metas.append(meta)
+    return metas
+
+
+def _refuse_newer(metas):
+    errors = [e for e in (store.meta_schema_error(m) for m in metas) if e]
+    if errors:
+        raise RuntimeError("\n".join(errors))
+
+
+def _strip_ids(cids, metas):
+    """Drop the given collection ids from the given entries' metas."""
+    touched = []
+    try:
+        for meta in metas:
+            meta["collections"] = [c for c in meta.get("collections", [])
+                                   if c not in cids]
+            store.save_meta(meta)
+            touched.append(meta)
+    finally:
+        library.update_entries(touched)  # see assign() for why in a finally
+    return sorted(m["package"] for m in touched)
 
 
 # ---------------------------------------------------------------------------
@@ -501,16 +541,25 @@ def assign(packages, cid, add=True):
     """Add or remove entries' membership in one collection (SPEC F8).
 
     Pure meta edit, batch-friendly, idempotent - re-adding an entry that is
-    already filed is a no-op, and an entry may sit in several collections."""
+    already filed is a no-op, and an entry may sit in several collections.
+
+    The whole batch is read and checked before the first write: an unknown
+    package or one written by a newer Kura (SPEC 5.6) refuses the batch
+    instead of leaving it half filed (2026-11-04)."""
     cid = str(cid)
     if add:
         _require(load()["collections"], cid)
+    metas = []
+    for pkg in dict.fromkeys(str(p) for p in packages):
+        meta = store.load_meta(pkg)
+        if meta is None:
+            raise RuntimeError("Not a library entry: %s" % pkg)
+        metas.append(meta)
+    _refuse_newer(metas)
     changed, touched = [], []
     try:
-        for pkg in dict.fromkeys(str(p) for p in packages):
-            meta = store.load_meta(pkg)
-            if meta is None:
-                raise RuntimeError("Not a library entry: %s" % pkg)
+        for meta in metas:
+            pkg = meta["package"]
             current = list(meta.get("collections", []))
             if add and cid not in current:
                 current.append(cid)
@@ -526,8 +575,8 @@ def assign(packages, cid, add=True):
         # One transaction for the batch: filing a package import's 661 roots
         # one update_entry() at a time spent seconds in sqlite commits
         # (2026-08-23). In a finally because the metas are already on disk -
-        # an unknown package later in the list must not leave the entries
-        # written before it missing from the index.
+        # a write failing later in the batch (disk full, a locked file) must
+        # not leave the entries written before it missing from the index.
         library.update_entries(touched)
     return {"ok": True, "changed": changed}
 

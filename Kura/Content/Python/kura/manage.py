@@ -36,8 +36,19 @@ def set_root(package, is_root):
 
 
 def set_roots(packages, is_root):
-    for pkg in packages:
-        set_root(pkg, is_root)
+    """set_root() for a multi-selection. Every entry is checked before the
+    first write, so an unknown or newer-Kura entry (SPEC 5.6) refuses the
+    batch instead of stopping halfway through it, and the index is updated
+    in one transaction (2026-11-04)."""
+    metas = [_require_meta(pkg) for pkg in packages]
+    touched = []
+    try:
+        for meta in metas:
+            meta["is_root"] = bool(is_root)
+            store.save_meta(meta)
+            touched.append(meta)
+    finally:
+        library.update_entries(touched)
     return {"count": len(packages)}
 
 
@@ -136,14 +147,29 @@ def move_folder(src_rel, dst_rel):
     dst_rel = dst_rel.replace("\\", "/").strip("/")
     if not src_rel or not dst_rel:
         raise ValueError("Empty folder path")
+    # Every segment becomes part of a package path, i.e. an identity. "." and
+    # ".." would be resolved by the filesystem but kept verbatim in the meta,
+    # minting an entry whose recorded package names no file (2026-11-04).
+    for part in dst_rel.split("/"):
+        if part in ("", ".", ".."):
+            raise ValueError("Invalid folder path: %s" % dst_rel)
     if dst_rel == src_rel:
         raise RuntimeError("%s is already there" % src_rel)
     if dst_rel.startswith(src_rel + "/"):
         raise RuntimeError("Cannot move %s into itself" % src_rel)
 
     src_prefix = store.package_of(src_rel) + "/"
-    moving = [m for m in store.iter_metas()
+    unreadable = []
+    moving = [m for m in store.iter_metas(unreadable)
               if m["package"].startswith(src_prefix)]
+    # A damaged meta cannot be rewritten for the new path; moving the rest
+    # would strand its asset file behind (D1, 2026-11-17).
+    damaged = [r for r in unreadable if r.startswith(src_rel + "/")]
+    if damaged:
+        raise RuntimeError(
+            "%s holds metadata that cannot be read (%s) - run Verify Library "
+            "and repair it before moving the folder"
+            % (src_rel, ", ".join(damaged)))
     if not moving:
         raise RuntimeError("No library entries under %s" % src_rel)
 
@@ -227,6 +253,8 @@ def rename_folder(src_rel, new_name):
     new_name = str(new_name).strip().strip("/")
     if not new_name:
         raise ValueError("Empty folder name")
+    if new_name in (".", ".."):
+        raise ValueError("A folder name cannot be %s" % new_name)
     bad = [c for c in '/\\:*?"<>|' if c in new_name]
     if bad:
         raise ValueError(
@@ -255,12 +283,16 @@ def rescan(progress=None):
                 rel = os.path.relpath(full, config.TREE_DIR)
                 tree_rels.add(rel[:-len(".uasset")].replace(os.sep, "/"))
     metas = {}
-    for m in store.iter_metas():
+    unreadable = []
+    for m in store.iter_metas(unreadable):
         rel = store.rel_path(m["package"])
         meta_rels.add(rel)
         metas[rel] = m
 
-    unregistered = sorted(store.package_of(r) for r in tree_rels - meta_rels)
+    # A file whose meta is damaged HAS a meta - it is reported once, under
+    # "unreadable", not a second time as a file without one.
+    unregistered = sorted(store.package_of(r)
+                          for r in tree_rels - meta_rels - set(unreadable))
     missing = sorted(metas[r]["package"] for r in meta_rels - tree_rels)
     modified = []
     shared = sorted(tree_rels & meta_rels)
@@ -304,6 +336,10 @@ def rescan(progress=None):
         "pruned_collections": pruned_collections,
         # Entries this Kura may read but not modify (SPEC 5.6).
         "newer_schema": newer_schema,
+        # Meta files that could not be parsed (truncated by a crash or a full
+        # disk). Left out of the index and hidden from the panel; reported so
+        # they can be re-sent or restored (D1, 2026-11-17).
+        "unreadable": sorted(store.package_of(r) for r in unreadable),
         # Dependencies nobody references any more - dead weight from deletes
         # done before the cascade existed, or from external edits. Reported
         # only; Clean Unused Dependencies is what archives them.
@@ -339,7 +375,8 @@ def list_archive():
             path = os.path.join(config.ARCHIVE_DIR, name)
             if not os.path.isdir(path):
                 continue
-            entries, size = [], 0
+            entries, metas, size = [], set(), 0
+            meta_root = os.path.join(path, "Meta")
             for dirpath, _dirs, files in os.walk(path):
                 for f in files:
                     full = os.path.join(dirpath, f)
@@ -347,7 +384,17 @@ def list_archive():
                     if f.endswith(".uasset"):
                         rel = os.path.relpath(full, os.path.join(path, "Content"))
                         entries.append(rel[:-len(".uasset")].replace(os.sep, "/"))
+                    elif f.endswith((".json", ".png")) and \
+                            os.path.normpath(dirpath).startswith(
+                                os.path.normpath(meta_root)):
+                        rel = os.path.relpath(
+                            os.path.splitext(full)[0], meta_root)
+                        metas.add(rel.replace(os.sep, "/"))
+            # Meta / thumbnails archived without their asset file: nothing to
+            # restore, kept until the user deletes the batch. Counted so such
+            # a batch does not read as "0 entries" with a size (R3).
             batches.append({"batch": name, "entries": sorted(entries),
+                            "orphans": len(metas - set(entries)),
                             "bytes": size})
     return {"batches": batches}
 
@@ -358,10 +405,19 @@ def restore_archive(batch):
     Per entry: blocked when the library already holds that package path (the
     stable-path slot is taken - path = identity, never overwrite silently);
     otherwise tree file + meta + thumbnail move back. Fully-restored batches
-    are removed; a partially-blocked batch keeps the blocked leftovers."""
+    are removed; a partially-blocked batch keeps the blocked leftovers.
+
+    A meta / thumbnail with no .uasset beside it (an entry deleted while its
+    file was already missing - Verify Library's "missing") is blocked too,
+    and stays where it is: there is nothing to restore, and never
+    hard-deleting (SPEC 5.1) means only Delete / Clear All may discard it.
+    Before 2026-11-04 the walk only looked at .uasset files, so such a batch
+    reported nothing and could never be emptied."""
     path = _archive_batch_dir(batch)
     restored, blocked = [], []
     content_root = os.path.join(path, "Content")
+    meta_root = os.path.join(path, "Meta")
+    asset_rels = set()
     for dirpath, _dirs, files in os.walk(content_root):
         for f in sorted(files):
             if not f.endswith(".uasset"):
@@ -369,6 +425,7 @@ def restore_archive(batch):
             full = os.path.join(dirpath, f)
             rel = os.path.relpath(full, content_root)[:-len(".uasset")] \
                 .replace(os.sep, "/")
+            asset_rels.add(rel)
             pkg = store.package_of(rel)
             if store.exists(pkg) or os.path.isfile(store.tree_file(pkg)):
                 blocked.append("%s: the library already has an entry at this "
@@ -383,6 +440,21 @@ def restore_archive(batch):
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.move(src, dst)
             restored.append(pkg)
+    orphans = set()
+    for dirpath, _dirs, files in os.walk(meta_root):
+        for f in files:
+            stem, ext = os.path.splitext(f)
+            if ext not in (".json", ".png"):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, stem), meta_root) \
+                .replace(os.sep, "/")
+            if rel not in asset_rels:
+                orphans.add(rel)
+    for rel in sorted(orphans):
+        blocked.append("%s: archived without its asset file (only the meta "
+                       "or thumbnail is in this batch), so there is nothing "
+                       "to restore - delete the batch to discard it"
+                       % store.package_of(rel))
     # Drop now-empty dirs; remove the batch folder entirely once emptied.
     for sub in ("Content", "Meta"):
         for dirpath, _dirs, _files in os.walk(os.path.join(path, sub),

@@ -19,12 +19,18 @@ public class Kura : ModuleRules
 			"Json",
 			"Projects",  // IPluginManager (KuraStyle locates Resources/)
 			"ToolMenus",
-			"ToolWidgets", // SSearchableComboBox (the collection picker, F8)
 			"DesktopPlatform", // OpenDirectoryDialog (Library Root picker, F5/first-run)
 			"PythonScriptPlugin",
 			"UnrealEd",      // ThumbnailTools, USceneThumbnailInfoWithPrimitive (SPEC 7.2)
 			"ImageCore",     // FImageView for PNG export
 			"ImageWrapper",  // PNG decode for the panel's thumbnail brushes
 		});
+
+		// SSearchableComboBox (the collection picker, F8) lived in ToolWidgets
+		// until 5.8 moved it into Slate (SPEC 7.4).
+		if (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion < 8)
+		{
+			PrivateDependencyModuleNames.Add("ToolWidgets");
+		}
 	}
 }

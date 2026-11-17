@@ -15,6 +15,8 @@
 #include "Misc/Paths.h"
 #include "Styling/AppStyle.h"
 #include "Styling/CoreStyle.h"
+#include "Styling/ISlateStyle.h"
+#include "Styling/SlateStyleRegistry.h"
 #include "Textures/SlateIcon.h"
 #include "Widgets/Colors/SColorBlock.h"
 #include "Widgets/Images/SImage.h"
@@ -46,6 +48,26 @@
 
 namespace
 {
+	/** A class tab's button icon. A plugin-owned class takes its icon from the
+	 *  plugin's style set, which is only registered while that plugin is
+	 *  enabled in this project - the fallback keeps the tab from showing the
+	 *  missing-brush placeholder there (SPEC F9). */
+	const FSlateBrush* ClassTabIcon(const KuraLibrary::FKuraClassTab& Tab)
+	{
+		if (!Tab.StyleSet)
+		{
+			return FAppStyle::GetBrush(Tab.Icon);
+		}
+		if (const ISlateStyle* Style = FSlateStyleRegistry::FindSlateStyle(Tab.StyleSet))
+		{
+			if (const FSlateBrush* Brush = Style->GetOptionalBrush(Tab.Icon, nullptr, nullptr))
+			{
+				return Brush;
+			}
+		}
+		return FAppStyle::GetBrush(Tab.FallbackIcon);
+	}
+
 	/** Icon button that opens the native folder picker and writes the chosen
 	 *  path back into the given text box (Library Root fields, F5/setup).
 	 *  OnPicked (optional) receives the chosen path: SetText raises no
@@ -279,7 +301,7 @@ TSharedRef<SWidget> SKuraBrowser::MakeTypeTabs()
 	{
 		Tabs->AddSlot(Idx, /*bRebuildChildren*/ false)
 			.Text(FText::FromString(KuraLibrary::ClassTabs[Idx].Label))
-			.Icon(FAppStyle::GetBrush(KuraLibrary::ClassTabs[Idx].Icon));
+			.Icon(ClassTabIcon(KuraLibrary::ClassTabs[Idx]));
 	}
 	Tabs->RebuildChildren();
 	return Tabs;
@@ -713,6 +735,13 @@ TSharedRef<SWidget> SKuraBrowser::MakeTilesColumn()
 				})
 				.Text_Lambda([this]()
 				{
+					const KuraLibrary::FKuraClassTab& Tab =
+						KuraLibrary::ClassTabs[FMath::Clamp(ActiveTab, 0, KuraLibrary::NumClassTabs - 1)];
+					if (ScopeCountOtherTabs > 0 && !Tab.bPointToOtherTabs)
+					{
+						return FText::Format(LOCTEXT("EmptyThisTabOnly", "No {0} here."),
+							FText::FromString(Tab.Label));
+					}
 					if (ScopeCountOtherTabs > 0)
 					{
 						return FText::Format(LOCTEXT("EmptyThisTab",
@@ -1347,8 +1376,20 @@ void SKuraBrowser::RefreshFromDisk(bool bForceFullReload)
 	// rather than re-read; the ones that did change are re-parsed, and new or
 	// deleted files are picked up by the walk either way.
 	TArray<TSharedPtr<FKuraEntry>> Previous = MoveTemp(AllEntries);
-	AllEntries = KuraLibrary::LoadEntries(bForceFullReload ? nullptr : &Previous);
+	int32 Unreadable = 0;
+	AllEntries = KuraLibrary::LoadEntries(bForceFullReload ? nullptr : &Previous, &Unreadable);
 	Previous.Reset();
+	// Entries whose meta is damaged are in the library but cannot be listed.
+	// Say so once per change in their number - every refresh would nag, and
+	// never saying it is how an asset "disappears" (D1, 2026-11-17).
+	if (Unreadable > 0 && Unreadable != UnreadableMetaNotified)
+	{
+		KuraActions::Notify(false, FText::Format(
+			LOCTEXT("UnreadableMeta",
+				"Kura: {0} library {0}|plural(one=entry has,other=entries have) damaged metadata and {0}|plural(one=is,other=are) hidden - run Verify Library to list {0}|plural(one=it,other=them)"),
+			Unreadable));
+	}
+	UnreadableMetaNotified = Unreadable;
 	EntryByPackage.Reset();
 	EntryByPackage.Reserve(AllEntries.Num());
 	for (const TSharedPtr<FKuraEntry>& E : AllEntries)
@@ -3314,6 +3355,16 @@ FString SKuraBrowser::ClassAbbrev(const FString& ClassName)
 	if (ClassName.StartsWith(TEXT("Texture")))
 	{
 		return TEXT("T");
+	}
+	// No thumbnail renderer exists for PCG assets, so this tile is all they
+	// ever show (SPEC F9).
+	if (ClassName == TEXT("PCGGraph"))
+	{
+		return TEXT("PCG");
+	}
+	if (ClassName == TEXT("PCGGraphInstance"))
+	{
+		return TEXT("PCGI");
 	}
 	return TEXT("?");
 }

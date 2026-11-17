@@ -10,7 +10,6 @@ repr() untouched.
 """
 import base64
 import json
-import os
 import traceback
 
 import unreal
@@ -80,23 +79,6 @@ def import_commit(packages_json, decisions_json="{}", force_version=False):
 
 
 @_json_api
-def library_status():
-    """First-run / library-health probe for the panel (SPEC F5).
-
-    configured: has the user saved config.json at least once (else first run).
-    initialized: does the current root already hold a library skeleton + db.
-    """
-    return {
-        "ok": True,
-        "configured": config.config_file_exists(),
-        "initialized": (os.path.isdir(config.TREE_DIR)
-                        and os.path.isfile(config.DB_PATH)),
-        "root": config.LIBRARY_ROOT,
-        "default_root": config.default_library_root(),
-    }
-
-
-@_json_api
 def init_library():
     """Create the library skeleton (folders, empty index, starting collection
     tree) at the current root, so a brand-new install is usable immediately
@@ -156,13 +138,6 @@ def delete_preview(packages_json):
 
 
 @_json_api
-def delete_entry(package):
-    result = manage.delete_entry(package)
-    result["ok"] = True
-    return result
-
-
-@_json_api
 def delete_entries(packages_json):
     """Archive a multi-selection; in-batch referrers are deleted first."""
     with progress.Reporter("Kura: archiving entries") as report:
@@ -208,11 +183,6 @@ def rescan():
         result = manage.rescan(progress=report)
     result["ok"] = True
     return result
-
-
-@_json_api
-def rebuild_index():
-    return {"ok": True, "entries": library.rebuild_index()}
 
 
 @_json_api

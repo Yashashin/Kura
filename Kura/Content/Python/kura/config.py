@@ -52,7 +52,11 @@ CONFIG_FILE = os.path.join(os.environ.get("APPDATA", ""), "Kura", "config.json")
 def _load():
     cfg = dict(_DEFAULTS)
     try:
-        with open(CONFIG_FILE, encoding="utf-8") as f:
+        # utf-8-sig: Windows Notepad saves UTF-8 with a BOM, which plain
+        # "utf-8" hands to json.load as a stray character - ValueError, the
+        # whole file ignored, and Kura silently back on the default library
+        # root (2026-11-04). Kura itself still writes without a BOM.
+        with open(CONFIG_FILE, encoding="utf-8-sig") as f:
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
@@ -119,4 +123,16 @@ ROOT_CLASSES = {
     "Texture2D",
     "TextureCube",
     "Texture2DArray",
+    "PCGGraph",
+    "PCGGraphInstance",
 }
+
+# PCG graphs (SPEC F9, 2026-10-07): the library takes PCG logic, never content.
+# A PCG asset is one whose class lives in the PCG module; /PCG/ is the plugin's
+# own content (built-in subgraphs, template meshes), present wherever the plugin
+# is enabled, so a PCG package may reference it the way anything may reference
+# /Engine/.
+PCG_ROOT_CLASSES = ("PCGGraph", "PCGGraphInstance")
+PCG_SCRIPT_PACKAGE = "/Script/PCG"
+PCG_MOUNT = "/PCG/"
+PCG_PLUGIN = "PCG"

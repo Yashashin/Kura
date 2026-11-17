@@ -45,7 +45,10 @@ CREATE INDEX idx_collections_package ON collections(package);
 
 
 def _connect():
-    os.makedirs(config.LIBRARY_ROOT, exist_ok=True)
+    # Never makedirs the root here: a moved / disconnected library must
+    # surface as guidance, not come back as an empty one at the stale path
+    # (R2, 2026-11-17). First-run setup creates the folders explicitly.
+    store.require_library_root()
     con = sqlite3.connect(config.DB_PATH)
     con.row_factory = sqlite3.Row
     return con
@@ -212,6 +215,20 @@ def packages_in_collection(cid):
         return [r[0] for r in con.execute(
             "SELECT package FROM collections WHERE cid=? ORDER BY package",
             (str(cid),))]
+    finally:
+        con.close()
+
+
+def collection_memberships():
+    """{cid: set of member packages} for every collection that has any - lets
+    catalog.list_tree() roll counts up a subtree without counting an entry
+    filed in two of its branches twice."""
+    con = _ensure()
+    try:
+        out = {}
+        for cid, package in con.execute("SELECT cid, package FROM collections"):
+            out.setdefault(cid, set()).add(package)
+        return out
     finally:
         con.close()
 

@@ -116,7 +116,7 @@ def sha256_of(path):
 
 
 def new_meta(package, cls, sha256, size, engine_version, source_project,
-             is_root, hard_deps, engine_deps):
+             is_root, hard_deps, engine_deps, required_plugins=()):
     now = now_iso()
     return {
         "schema_version": config.META_SCHEMA_VERSION,
@@ -137,6 +137,10 @@ def new_meta(package, cls, sha256, size, engine_version, source_project,
         "notes": "",
         "hard_deps": sorted(str(d) for d in hard_deps),
         "engine_deps": sorted(str(d) for d in engine_deps),
+        # Plugins the asset needs in whatever project it is imported into
+        # (SPEC F9; only PCG packages fill it). Added 2026-10-07; schema_version
+        # stays 2 - an old meta reads as "needs nothing" (SPEC 5.6).
+        "required_plugins": sorted(str(p) for p in required_plugins),
     }
 
 
@@ -163,12 +167,30 @@ def meta_schema_error(meta):
 
 
 def load_meta(package):
-    """Meta dict for a package, or None if the entry is not in the library."""
+    """Meta dict for a package, or None if the entry is not in the library.
+
+    A meta that exists but cannot be parsed (truncated by a crash or a full
+    disk) is neither: it raises, naming the file, so a caller cannot mistake
+    the entry for absent and the user is told where to look (D1, 2026-11-17)."""
+    path = meta_file(package)
     try:
-        with open(meta_file(package), encoding="utf-8") as f:
-            return json.load(f)
+        with open(path, encoding="utf-8") as f:
+            meta = json.load(f)
     except OSError:
         return None
+    except ValueError:
+        meta = None
+    if not _is_entry_meta(meta):
+        raise RuntimeError(
+            "The metadata file for %s is damaged and cannot be read: %s - "
+            "run Verify Library to list damaged entries, then send the asset "
+            "to Kura again or restore the file from a backup."
+            % (package, path))
+    return meta
+
+
+def _is_entry_meta(meta):
+    return isinstance(meta, dict) and isinstance(meta.get("package"), str)
 
 
 def save_meta(meta):
@@ -188,8 +210,14 @@ def exists(package):
     return os.path.isfile(meta_file(package))
 
 
-def iter_metas():
+def iter_metas(unreadable=None):
     """Yield every per-asset meta dict in the library (Meta mirror walk).
+
+    A file that cannot be parsed, or that parses to something other than an
+    entry, is skipped rather than raised: one truncated meta used to take
+    down the index rebuild and Verify Library - the rescue tool itself (D1,
+    2026-11-17). Pass a list as `unreadable` to collect those files as
+    Meta-relative paths without the extension ("Props/SM_Chair").
 
     Skips the reserved files the mirror also hosts - collections.json sits at
     the top of Meta/ but describes the collection tree, not an asset. Matched
@@ -204,8 +232,19 @@ def iter_metas():
                 continue
             if at_top and name in config.RESERVED_META_FILES:
                 continue
-            with open(os.path.join(dirpath, name), encoding="utf-8") as f:
-                yield json.load(f)
+            full = os.path.join(dirpath, name)
+            try:
+                with open(full, encoding="utf-8") as f:
+                    meta = json.load(f)
+            except ValueError:  # JSONDecodeError / UnicodeDecodeError
+                meta = None
+            if not _is_entry_meta(meta):
+                if unreadable is not None:
+                    rel = os.path.relpath(full, config.META_DIR)
+                    unreadable.append(
+                        rel[:-len(".json")].replace(os.sep, "/"))
+                continue
+            yield meta
 
 
 # ---------------------------------------------------------------------------
@@ -249,11 +288,26 @@ def clear_archive():
     return freed
 
 
+def _is_strictly_inside(path, stop):
+    """True when `path` lies below `stop` (never `stop` itself).
+
+    Compared per path component, not as strings: "C:\\Lib\\Content2" starts
+    with "C:\\Lib\\Content" but is not inside it. normcase folds Windows case
+    and separators; commonpath raises across drives, which is "not inside"."""
+    path = os.path.normcase(os.path.abspath(path))
+    stop = os.path.normcase(os.path.abspath(stop))
+    try:
+        return path != stop and os.path.commonpath([path, stop]) == stop
+    except ValueError:
+        return False
+
+
 def _prune_empty_dirs(path, stop):
-    """Remove now-empty folders up to (not including) `stop`."""
-    stop = os.path.normpath(stop)
+    """Remove now-empty folders up to (not including) `stop`. Anything not
+    inside `stop` is left alone - this deletes folders, so it does not rely
+    on its callers handing it a path that happens to be under `stop`."""
     path = os.path.normpath(path)
-    while path.startswith(stop) and path != stop:
+    while _is_strictly_inside(path, stop):
         try:
             os.rmdir(path)  # fails on non-empty, which ends the walk
         except OSError:

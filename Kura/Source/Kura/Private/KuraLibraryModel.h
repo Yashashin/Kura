@@ -89,7 +89,15 @@ namespace KuraLibrary
 	{
 		const TCHAR* Label;
 		const TCHAR* Classes; // "|"-separated; empty = matches every class
-		const TCHAR* Icon;    // FAppStyle brush for the tab button
+		const TCHAR* Icon;    // brush for the tab button, FAppStyle unless StyleSet says otherwise
+		/** A plugin's style set holding Icon, for classes a plugin owns. That set
+		 *  only exists while the plugin is enabled, hence the FAppStyle fallback. */
+		const TCHAR* StyleSet = nullptr;
+		const TCHAR* FallbackIcon = nullptr;
+		/** When this tab comes up empty, point at the assets the other tabs
+		 *  hold. Off for PCG: graphs are rarely filed with anything else, so
+		 *  the hint would fire on nearly every collection and say nothing. */
+		bool bPointToOtherTabs = true;
 	};
 	/** The single source of truth for the tab strip - the widget is built by
 	 *  walking this, so adding or reordering a tab is a one-line edit here. */
@@ -107,6 +115,11 @@ namespace KuraLibrary
 			TEXT("ClassIcon.Material") },
 		{ TEXT("Textures"), TEXT("Texture2D|TextureCube|Texture2DArray"),
 			TEXT("ClassIcon.Texture2D") },
+		// SPEC F9 (2026-10-07). The library can hold PCG graphs while the
+		// current project has PCG off, so the tab exists either way.
+		{ TEXT("PCG Graphs"), TEXT("PCGGraph|PCGGraphInstance"),
+			TEXT("ClassIcon.PCGGraph"), TEXT("PCGEditorStyle"), TEXT("Icons.World"),
+			/*bPointToOtherTabs*/ false },
 	};
 	constexpr int32 NumClassTabs = UE_ARRAY_COUNT(ClassTabs);
 
@@ -181,9 +194,14 @@ namespace KuraLibrary
 	 *  library (10,828 files, seconds of it on a spinning disk). The walk still
 	 *  happens - that is what notices additions and deletions - but it is one
 	 *  stat-carrying pass, not one open per entry. Nullptr = full reload, which
-	 *  is what the toolbar's Refresh does. */
+	 *  is what the toolbar's Refresh does.
+	 *
+	 *  OutUnreadable receives the number of meta files that exist but could
+	 *  not be parsed. Those entries are left out; they are never carried
+	 *  over, so the count is right on an incremental pass too. */
 	TArray<TSharedPtr<FKuraEntry>> LoadEntries(
-		const TArray<TSharedPtr<FKuraEntry>>* Previous = nullptr);
+		const TArray<TSharedPtr<FKuraEntry>>* Previous = nullptr,
+		int32* OutUnreadable = nullptr);
 
 	/** Folder tree derived from the entries: the folders that hold them, plus
 	 *  their ancestors. One tree for the whole library since 2026-08-10 - the

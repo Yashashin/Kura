@@ -81,8 +81,17 @@ TSharedPtr<FJsonObject> KuraPython::Call(const FString& Statement)
 	// value's repr(), which would mangle a raw JSON string with \' escapes,
 	// but leaves a base64 payload untouched apart from the outer quotes.
 	FString Payload = Cmd.CommandResult.TrimStartAndEnd();
+	// Only a MATCHED pair is the repr's quoting. Anything else is not the
+	// string editor_api returns, and trimming it blind turned that into a
+	// base64 failure further down instead of a message naming the cause.
 	if (Payload.Len() >= 2 && (Payload[0] == TEXT('\'') || Payload[0] == TEXT('"')))
 	{
+		if (Payload[Payload.Len() - 1] != Payload[0])
+		{
+			UE_LOG(LogKuraPy, Error, TEXT("Unexpected result from %s (unbalanced quotes): %s"),
+				*Cmd.Command, *Cmd.CommandResult);
+			return nullptr;
+		}
 		Payload = Payload.Mid(1, Payload.Len() - 2);
 	}
 	FString Json;

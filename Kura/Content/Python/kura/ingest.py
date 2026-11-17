@@ -10,7 +10,7 @@ import shutil
 
 import unreal
 
-from . import catalog, config, deps, library, progress, store
+from . import catalog, config, deps, library, pcg, progress, store
 
 
 def content_dir():
@@ -72,9 +72,11 @@ def _render_thumbnail(pkg, cls):
 def _export_thumbnails(items):
     """Write thumbnail PNGs into the Meta mirror (SPEC 7.2) for EVERY entry
     in the batch - re-sending an asset re-renders after a camera/config
-    tweak, so no stale-PNG skipping."""
+    tweak, so no stale-PNG skipping. PCG assets are left out: no thumbnail
+    renderer exists for them, so a render only logs a warning (SPEC F9)."""
     if is_headless():
         return
+    items = [i for i in items if not i.get("pcg")]
     # The slowest phase of an upload by far - one render per asset.
     with progress.Reporter("Kura: rendering thumbnails") as report:
         for idx, item in enumerate(items, 1):
@@ -102,6 +104,10 @@ def rerender_thumbnails(packages):
             meta = store.load_meta(pkg)
             if meta is None:
                 errors.append("%s: not a library entry" % pkg)
+                continue
+            if meta.get("class") in config.PCG_ROOT_CLASSES:
+                errors.append("%s: PCG graphs have no thumbnail - the panel "
+                              "shows a PCG tile for them instead" % pkg)
                 continue
             src = package_to_file(pkg)
             if not os.path.isfile(src):
@@ -185,17 +191,23 @@ def _save_dirty(packages):
     return saved
 
 
-def _direct_deps(pkg):
-    """Direct hard deps of one package, split into (game, engine)."""
-    ar = unreal.AssetRegistryHelpers.get_asset_registry()
-    game, engine = [], []
-    for dep in ar.get_dependencies(pkg, deps._hard_only_options()) or []:
-        d = str(dep)
-        if d.startswith("/Engine/"):
-            engine.append(d)
+def _direct_deps(pkg, is_pcg=False):
+    """Direct hard deps of one package, split into (game, engine).
+
+    For a PCG package "engine" also holds its /PCG/ references and the soft
+    ones into /Engine/ and /PCG/ - everything a clean graph may still point
+    at, recorded so the detail panel can show it (SPEC F9)."""
+    engine_like = ("/Engine/", config.PCG_MOUNT) if is_pcg else ("/Engine/",)
+    game, engine = [], set()
+    for d in deps.hard_dependencies(pkg):
+        if d.startswith(engine_like):
+            engine.add(d)
         elif d.startswith("/Game/"):
             game.append(d)
         # /Script/ ignored; other mounts already blocked by collect()
+    if is_pcg:
+        engine.update(d for d in deps.soft_dependencies(pkg)
+                      if d.startswith(engine_like))
     return sorted(game), sorted(engine)
 
 
@@ -209,7 +221,8 @@ def analyze(root_packages, deps_as_roots=False):
     Returns {"ok", "errors", "roots", "items"}; items only when ok.
     Item: {package, class, is_root, selected, status: new|same|conflict, size,
            sha256 (only when this pass computed one - commit() reuses it),
-           referrers (library entries affected, conflict only)}.
+           referrers (library entries affected, conflict only),
+           pcg, required_plugins (SPEC F9; empty for anything not PCG)}.
 
     selected: the user picked this one in the Content Browser, as opposed to
     Kura collecting it around them. Separate from is_root because
@@ -228,8 +241,9 @@ def analyze(root_packages, deps_as_roots=False):
             errors.append(
                 "%s: class %s cannot be sent to Kura as a root asset. This "
                 "version collects StaticMesh / Material / Material Instance / "
-                "Texture; other types (SkeletalMesh, Blueprint, Niagara, ...) "
-                "are on the roadmap - see the project page" % (pkg, cls))
+                "Texture / PCG Graph; other types (SkeletalMesh, Blueprint, "
+                "Niagara, ...) are on the roadmap - see the project page"
+                % (pkg, cls))
     if errors:
         return {"ok": False, "errors": errors, "roots": roots, "items": []}
 
@@ -255,12 +269,25 @@ def analyze(root_packages, deps_as_roots=False):
             "Dependencies outside /Game and /Engine are not supported: %s"
             % d["other"])
 
+    class_paths = {pkg: deps.class_path(pkg) for pkg in d["game"]}
+    classes = {pkg: cp[1] for pkg, cp in class_paths.items()}
+
+    # PCG graphs go in without content (SPEC F9): every PCG package in the
+    # closure - subgraphs included - is held to the clean rule, and the code
+    # modules it uses become the plugins an import will require.
+    pcg_packages = sorted(p for p, cp in class_paths.items()
+                          if cp[0] == config.PCG_SCRIPT_PACKAGE)
+    plugins = {}
+    if pcg_packages:
+        errors += pcg.clean_errors(pcg_packages)
+        for pkg in pcg_packages:
+            plugins[pkg], plugin_errors = pcg.required_plugins(pkg)
+            errors += plugin_errors
+
     # 4. placement validation (SPEC 5.4): block, never move. Since 2026-08-10
     #    that is only "under the stable prefix" - folder layout is the user's
     #    (Q24), and classification lives in collections (F8).
-    classes = {}
     for pkg in d["game"]:
-        classes[pkg] = deps.primary_class(pkg)
         err = store.placement_error(pkg)
         if err:
             if deps.is_redirector(pkg):
@@ -316,6 +343,8 @@ def analyze(root_packages, deps_as_roots=False):
                 "size": size,
                 "sha256": sha,  # None = not computed here; commit() will
                 "referrers": referrers,
+                "pcg": pkg in plugins,
+                "required_plugins": plugins.get(pkg, []),
             })
     if errors:
         return {"ok": False, "errors": errors, "roots": roots, "items": []}
@@ -376,7 +405,7 @@ def commit(root_packages, decisions=None, deps_as_roots=False, add_tags=None,
                     promoted.append(meta)
             continue
 
-        hard, engine = _direct_deps(pkg)
+        hard, engine = _direct_deps(pkg, item["pcg"])
         # analyze() just hashed this file unless it settled the comparison on
         # size alone; either way the file is read at most once per commit.
         sha = item.get("sha256") or store.sha256_of(src)
@@ -385,15 +414,19 @@ def commit(root_packages, decisions=None, deps_as_roots=False, add_tags=None,
             meta = store.new_meta(pkg, item["class"], sha,
                                   item["size"], ever, project,
                                   item["is_root"] or old.get("is_root"),
-                                  hard, engine)
-            # identity survives an update: keep first-ingest time, tags, notes
+                                  hard, engine, item["required_plugins"])
+            # identity survives an update: keep first-ingest time, tags, notes,
+            # and the filing - an update replaces the version, not where the
+            # user put it (collections were dropped here until 2026-10-07)
             meta["ingested_at"] = old.get("ingested_at", meta["ingested_at"])
             meta["tags"] = old.get("tags", [])
             meta["notes"] = old.get("notes", "")
+            meta["collections"] = old.get("collections", [])
         else:  # new
             meta = store.new_meta(pkg, item["class"], sha,
                                   item["size"], ever, project,
-                                  item["is_root"], hard, engine)
+                                  item["is_root"], hard, engine,
+                                  item["required_plugins"])
         if batch_tags:
             meta["tags"] = sorted(set(meta["tags"]) | batch_tags)
         plan.append((item, meta))
@@ -413,6 +446,10 @@ def commit(root_packages, decisions=None, deps_as_roots=False, add_tags=None,
                 shutil.copy2(package_to_file(item["package"]), tmp)
     except OSError as e:
         _cleanup_staging(staged)
+        # The root promotions above are already in their metas; without this
+        # the index kept calling them dependencies until the next full
+        # rebuild (2026-11-04). The library's FILES were not modified.
+        library.update_entries(promoted)
         return {"ok": False, "added": [], "updated": [], "skipped": skipped,
                 "errors": ["Staging copy failed - the library was not "
                            "modified: %s" % e]}
@@ -450,12 +487,16 @@ def commit(root_packages, decisions=None, deps_as_roots=False, add_tags=None,
     # File the batch (F8). After the index update, so membership lands on
     # entries that are already registered. A filing problem must not fail an
     # upload whose files are already safely in the library - report and move on.
-    filed = []
+    filed, filing_error = [], ""
     if collection:
         try:
             filed = catalog.assign(
                 [p for p in a["roots"] if store.exists(p)], collection)["changed"]
         except (RuntimeError, ValueError) as e:
+            # Returned as well as logged: the panel shows it next to the
+            # success notice, the way a .kurapack import reports
+            # collections.error (R1, 2026-11-17).
+            filing_error = str(e)
             unreal.log_warning("Kura: assets were uploaded but could not be "
                                "added to the collection: %s" % e)
 
@@ -467,4 +508,5 @@ def commit(root_packages, decisions=None, deps_as_roots=False, add_tags=None,
     unreal.log("Kura: ingest done - added %d, updated %d, skipped %d"
                % (len(added), len(updated), len(skipped)))
     return {"ok": True, "errors": [], "added": added, "updated": updated,
-            "skipped": skipped, "filed": filed}
+            "skipped": skipped, "filed": filed,
+            "filing_error": filing_error}

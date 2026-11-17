@@ -67,7 +67,7 @@ def _load_config():
     cfg = {"master_material": "", "last_category": "", "flip_green": False,
            "rules": DEFAULT_RULES}
     try:
-        with open(CONFIG_FILE, encoding="utf-8") as f:
+        with open(CONFIG_FILE, encoding="utf-8-sig") as f:  # BOM-tolerant
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
@@ -87,7 +87,7 @@ def _lib_prefix():
     """Stable path prefix, read straight from Kura's config.json (a plain
     file read - still no kura import)."""
     try:
-        with open(KURA_CONFIG_FILE, encoding="utf-8") as f:
+        with open(KURA_CONFIG_FILE, encoding="utf-8-sig") as f:  # BOM-tolerant
             return json.load(f).get("lib_prefix", "/Game/_AssetLib")
     except (OSError, ValueError):
         return "/Game/_AssetLib"
@@ -106,8 +106,10 @@ def _clean_name(name):
 
 
 def _clean_category(category):
-    parts = [p for p in re.split(r"[\\/]+", str(category).strip()) if p]
-    return "/".join(_clean_name(p) for p in parts)
+    # Segments that clean to nothing ("..", ".", "!!!") are dropped rather
+    # than joined in as empty path segments ("a/../b" used to give "a//b").
+    parts = (_clean_name(p) for p in re.split(r"[\\/]+", str(category).strip()))
+    return "/".join(p for p in parts if p)
 
 
 def _tokens(filename):
@@ -201,6 +203,25 @@ def scan(root_dir, category):
             info["errors"].append("Target already exists: %s" % info["mi"])
 
         sets.append(info)
+
+    # Folder names are cleaned into asset names, so two folders can land on
+    # one set folder ("Wood 01" / "Wood_01") or on none at all ("!!!"). The
+    # existence checks above cannot see that - neither target exists yet -
+    # and commit() would mix the two sets' textures into one MI folder
+    # (2026-11-04).
+    seen = {}
+    for info in sets:
+        seen.setdefault(info["name"], []).append(info)
+    for name, group in seen.items():
+        for info in group:
+            if not name:
+                info["errors"].append("The folder name has no usable "
+                                      "characters for an asset name - "
+                                      "rename the folder")
+            elif len(group) > 1:
+                info["errors"].append("%d folders become the same set name "
+                                      "%s - rename all but one"
+                                      % (len(group), name))
 
     if not sets:
         return {"ok": False, "sets": [],
