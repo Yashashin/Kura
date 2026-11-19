@@ -102,7 +102,7 @@ A PCG Graph or Graph Instance goes into the library as **pure logic**: the graph
 - **What blocks an upload:** a graph that points at project content — a mesh set on a Static Mesh Spawner, a Graph Parameter with a default value, a parameter override on a subgraph node, a Spawn Actor pointing at a Blueprint. The message names the graph holding the reference, so one buried three subgraphs deep is still findable. Clear the reference, or expose it as a Graph Parameter with no default.
 - **How to use an imported graph:** create a Graph Instance of it in your project, *outside* `_AssetLib`, and set the meshes there through Graph Parameters. Editing the imported graph's Spawner nodes works too, but you are then editing your project's copy of the library version — importing that graph again, or another graph sharing one of its subgraphs, raises a conflict, and choosing the library version overwrites your settings.
 - **The PCG plugin has to be on** in the project you import into; otherwise the import is refused and tells you to enable it in **Edit → Plugins**. Kura itself does not need PCG and never enables it for you. Graphs using nodes from another plugin record that plugin and check for it the same way; graphs using custom nodes from a project's own C++ module cannot be uploaded.
-- PCG graphs have no thumbnail — tiles show a `PCG` / `PCGI` type block instead.
+- PCG graphs have no rendered thumbnail — tiles show the engine's PCG Graph / Graph Instance icon, as in the Content Browser.
 
 ## 🛠️ Configuration
 

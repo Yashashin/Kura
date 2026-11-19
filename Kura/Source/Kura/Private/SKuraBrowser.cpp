@@ -17,6 +17,7 @@
 #include "Styling/CoreStyle.h"
 #include "Styling/ISlateStyle.h"
 #include "Styling/SlateStyleRegistry.h"
+#include "Styling/StyleColors.h"
 #include "Textures/SlateIcon.h"
 #include "Widgets/Colors/SColorBlock.h"
 #include "Widgets/Images/SImage.h"
@@ -66,6 +67,25 @@ namespace
 			}
 		}
 		return FAppStyle::GetBrush(Tab.FallbackIcon);
+	}
+
+	/** The engine's own class picture for asset types that never get a
+	 *  rendered PNG - PCG graphs have no thumbnail renderer (SPEC F9), so this
+	 *  is the same image the Content Browser shows for them. Null while the
+	 *  owning plugin is off in this project (its style set is not registered
+	 *  then); the tile keeps its abbreviation in that case. */
+	const FSlateBrush* ClassPlaceholderIcon(const FString& ClassName)
+	{
+		if (ClassName != TEXT("PCGGraph") && ClassName != TEXT("PCGGraphInstance"))
+		{
+			return nullptr;
+		}
+		if (const ISlateStyle* Style = FSlateStyleRegistry::FindSlateStyle(TEXT("PCGEditorStyle")))
+		{
+			return Style->GetOptionalBrush(
+				FName(*(FString(TEXT("ClassThumbnail.")) + ClassName)), nullptr, nullptr);
+		}
+		return nullptr;
 	}
 
 	/** Icon button that opens the native folder picker and writes the chosen
@@ -2295,6 +2315,11 @@ TSharedRef<ITableRow> SKuraBrowser::MakeEntryTile(TSharedPtr<FKuraEntry> Item, c
 	// placeholder - a class-colored tile is what an entry with no thumbnail at
 	// all looks like too, so nothing flickers between the two states.
 	const FString ThumbPath = Item->ThumbPath;
+	// Types without a thumbnail renderer show their engine class picture on
+	// a dark tile instead of letters on the class color (2026-11-18). Resolved once per
+	// tile: tiles are rebuilt on every refresh, and the brush lives as long
+	// as its plugin's style set.
+	const FSlateBrush* const PlaceholderIcon = ClassPlaceholderIcon(Item->Class);
 	TSharedRef<SWidget> Preview =
 		SNew(SOverlay)
 		+ SOverlay::Slot()
@@ -2309,15 +2334,44 @@ TSharedRef<ITableRow> SKuraBrowser::MakeEntryTile(TSharedPtr<FKuraEntry> Item, c
 			})
 			+ SOverlay::Slot()
 			[
+				// With an icon the tile reads like the Content Browser's: the
+				// icon on the editor's recessed dark, the class color only in
+				// the strip below. A full colored slab behind a grey icon
+				// looked wrong (Ricky, 2026-11-18).
 				SNew(SColorBlock)
-				.Color(ClassColor(Item->Class))
+				.Color(PlaceholderIcon
+					? FStyleColors::Recessed.GetSpecifiedColor()
+					: ClassColor(Item->Class))
 			]
 			+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
 			[
 				SNew(STextBlock)
+				.Visibility(PlaceholderIcon ? EVisibility::Collapsed : EVisibility::HitTestInvisible)
 				.Text(FText::FromString(ClassAbbrev(Item->Class)))
 				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 22))
 				.ColorAndOpacity(FLinearColor::White)
+			]
+			+ SOverlay::Slot()
+			[
+				// Scales with the tile-size slider: the 64 px icon sits in a
+				// 100 px box, so it always takes about two thirds of the tile,
+				// as in the Content Browser. The brushes are SVG, so they stay
+				// sharp at any size.
+				SNew(SScaleBox)
+				.Visibility(PlaceholderIcon ? EVisibility::HitTestInvisible : EVisibility::Collapsed)
+				.Stretch(EStretch::ScaleToFit)
+				[
+					SNew(SBox)
+					.WidthOverride(100.f)
+					.HeightOverride(100.f)
+					.HAlign(HAlign_Center)
+					.VAlign(VAlign_Center)
+					[
+						SNew(SImage)
+						.Image(PlaceholderIcon)
+						.DesiredSizeOverride(FVector2D(64.f, 64.f))
+					]
+				]
 			]
 		]
 		+ SOverlay::Slot()
