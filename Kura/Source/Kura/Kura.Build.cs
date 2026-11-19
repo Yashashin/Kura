@@ -15,7 +15,8 @@ public class Kura : ModuleRules
 			"SlateCore",
 			"InputCore",
 			"ApplicationCore", // clipboard (Copy Package Path)
-			"AssetTools",    // IAssetTools::GetTypeColor - the Content Browser's own type colors
+			"AssetTools",    // IAssetTools::GetTypeColor (Content Browser type colors), FixupReferencers
+			"AssetRegistry", // wait for discovery before Fix Up Redirectors
 			"Json",
 			"Projects",  // IPluginManager (KuraStyle locates Resources/)
 			"ToolMenus",

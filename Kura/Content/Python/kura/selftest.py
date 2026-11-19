@@ -460,9 +460,77 @@ def run_host_test():
 
     _run_reserved_name_check()
     _run_pcg_checks()
+    _run_redirector_check()
 
     unreal.log_warning("Kura selftest HOST PASS (master unique, conflict flow "
                        "+ collections + pack filing + PCG clean rule verified)")
+
+
+RD_OLD = config.LIB_PREFIX + "/KuraTest/Redirect/T_RedirOld"
+RD_NEW = config.LIB_PREFIX + "/KuraTest/Redirect/T_RedirNew"
+RD_MI = config.LIB_PREFIX + "/KuraTest/Redirect/MI_Redir"
+
+
+def _run_redirector_check():
+    """Redirectors under the prefix (SPEC F1 step 2). Until 2026-11-19 ingest
+    called an AssetTools.fixup_referencers that Python never had, so any
+    redirector blocked every upload with an AttributeError - and no check
+    here ever made one.
+
+    The fixup itself ends in the engine's modal report window, which a
+    commandlet cannot show, so headless it is skipped by design; what this
+    checks is that the upload then stops with guidance naming the
+    redirector instead of crashing or carrying it into the library. The
+    editor path needs a hand check (PROJECT_STATUS UI-01).
+
+    UE leaves a redirector on rename only when something still needs the old
+    path. A Content Browser collection holding the asset is the case that
+    works headless (a level referencer crashes the commandlet; a read-only
+    referencer makes the rename refuse)."""
+    sub = _asset_sub()
+    at = unreal.AssetToolsHelpers.get_asset_tools()
+    mel = unreal.MaterialEditingLibrary
+    _check(sub.duplicate_asset(TEX, RD_OLD), "duplicate redirect texture")
+    folder, name = RD_MI.rsplit("/", 1)
+    mi = at.create_asset(name, folder, unreal.MaterialInstanceConstant,
+                         unreal.MaterialInstanceConstantFactoryNew())
+    _check(mi, "create MI_Redir")
+    mel.set_material_instance_parent(mi, sub.load_asset(MA))
+    mel.set_material_instance_texture_parameter_value(
+        mi, "BaseTex", sub.load_asset(RD_OLD))
+    for pkg in (RD_OLD, RD_MI):
+        _check(sub.save_asset(pkg, False), "save %s" % pkg)
+    # Just-saved assets have an empty dependency graph until rescanned.
+    deps.refresh_files([ingest.package_to_file(p) for p in (RD_MI, RD_OLD)])
+    cm = unreal.get_editor_subsystem(unreal.CollectionManagerSubsystem)
+    res = cm.create_or_empty_collection(
+        cm.get_collection_containers()[0], "KuraSelftestRedirect",
+        unreal.CollectionShareType.LOCAL)
+    coll = res[-1] if isinstance(res, tuple) else res
+    _check(cm.add_asset_to_collection(coll, unreal.SoftObjectPath(
+        RD_OLD + "." + RD_OLD.rsplit("/", 1)[1])),
+        "add the texture to a collection")
+    try:
+        _check(sub.rename_asset(RD_OLD, RD_NEW), "rename the texture")
+    finally:
+        cm.destroy_collection(coll)
+    unreal.EditorLoadingAndSavingUtils.save_dirty_packages(False, True)
+    deps.refresh_files([ingest.package_to_file(RD_OLD)])
+    _check(ingest._redirectors_under_prefix() == [RD_OLD],
+           "renaming must leave a redirector to test against: %s"
+           % ingest._redirectors_under_prefix())
+
+    r = ingest.analyze([RD_MI])
+    _check(not r["ok"] and any("Fix Up Redirectors" in e and RD_OLD in e
+                               for e in r["errors"]),
+           "a redirector left in place must stop the upload with guidance: %s"
+           % r["errors"])
+    _check(not any(f.endswith("T_RedirOld.uasset")
+                   for _d, _s, fs in os.walk(config.TREE_DIR) for f in fs),
+           "the redirector must not reach the library")
+    for pkg in (RD_MI, RD_NEW, RD_OLD):
+        if sub.does_asset_exist(pkg):
+            sub.delete_asset(pkg)
 
 
 def _run_reserved_name_check():

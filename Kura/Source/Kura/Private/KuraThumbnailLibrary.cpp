@@ -1,11 +1,15 @@
 #include "KuraThumbnailLibrary.h"
 
 #include "AssetCompilingManager.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "IAssetTools.h"
+#include "UObject/ObjectRedirector.h"
 #include "Components/ReflectionCaptureComponent.h"
 #include "Components/SkyLightComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StreamableRenderAsset.h"
 #include "Engine/Texture.h"
+#include "Framework/Application/SlateApplication.h"
 #include "HAL/FileManager.h"
 #include "ImageUtils.h"
 #include "Materials/MaterialInterface.h"
@@ -293,4 +297,56 @@ bool UKuraThumbnailLibrary::ExportMaterialThumbnailPng(const FString& PackageNam
 		Package->SetDirtyFlag(false);
 	}
 	return bOk;
+}
+
+bool UKuraThumbnailLibrary::FixupRedirectors(const TArray<FString>& PackageNames)
+{
+	// The engine's fixup ends in a modal report and reads the answer back
+	// unconditionally. Headless there is no Slate to show it in (assert), and
+	// under -ExecutePythonScript (GIsRunningUnattendedScript) Slate cancels
+	// the window and the engine then asserts on the missing answer - which is
+	// how bulk-upload scripts run. Both are skipped; the caller reports the
+	// redirectors that are left.
+	if (IsRunningCommandlet() || GIsRunningUnattendedScript || !FSlateApplication::IsInitialized())
+	{
+		UE_LOG(LogKuraThumb, Warning,
+			TEXT("Fix Up Redirectors needs an interactive editor (it ends with a report window); skipped"));
+		return false;
+	}
+	TArray<UObjectRedirector*> Valid;
+	for (const FString& PackageName : PackageNames)
+	{
+		UPackage* Package = LoadPackage(nullptr, *PackageName, LOAD_None);
+		if (!Package)
+		{
+			continue;
+		}
+		ForEachObjectWithOuter(Package, [&Valid](UObject* Object)
+		{
+			if (UObjectRedirector* Redirector = Cast<UObjectRedirector>(Object))
+			{
+				Valid.Add(Redirector);
+			}
+		}); // default flags: the 5.8 bool overload is deprecated, and a nested
+		    // object is never a redirector anyway
+	}
+	if (Valid.Num() == 0)
+	{
+		return true;
+	}
+	// FixupReferencers runs synchronously only once the registry has finished
+	// discovering assets; before that it opens a "discovering assets" dialog
+	// and fixes up later, after the upload has moved on without it.
+	IAssetRegistry& Registry = IAssetRegistry::GetChecked();
+	if (Registry.IsLoadingAssets())
+	{
+		Registry.WaitForCompletion();
+	}
+	// No checkout prompt: Kura's library prefix is not under source control
+	// in the projects it targets, and a modal in the middle of an upload
+	// preview would only get in the way. Fixed-up redirectors are deleted,
+	// the same as the Content Browser's Fix Up Redirectors.
+	IAssetTools::Get().FixupReferencers(Valid, /*bCheckoutDialogPrompt*/ false,
+		ERedirectFixupMode::DeleteFixedUpRedirectors);
+	return true;
 }

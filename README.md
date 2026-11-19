@@ -146,7 +146,7 @@ The panel keeps its own state in the same file. The first two are also in **Sett
 
 Back up the library root and you have backed up everything that matters — the two `%APPDATA%` files only hold preferences.
 
-Kura writes into your *project* only when you ask: **Import**, **Create _AssetLib Folder**, the PBR Material Importer. Preparing an upload adds two small ones — Fix Up Redirectors over `/Game/_AssetLib`, and saving any selected asset with unsaved edits, so what lands in the library is what is on disk. Nothing else: browsing never writes, and the thumbnail camera override is undone, dirty flag included, the moment the PNG exists.
+Kura writes into your *project* only when you ask: **Import**, **Create _AssetLib Folder**, the PBR Material Importer. Preparing an upload adds two small ones — Fix Up Redirectors over `/Game/_AssetLib` (only when there are redirectors; Unreal's own Redirector Update Report window appears, as with the Content Browser command), and saving any selected asset with unsaved edits, so what lands in the library is what is on disk. Nothing else: browsing never writes, and the thumbnail camera override is undone, dirty flag included, the moment the PNG exists.
 
 ## 🔄 Updating and uninstalling
 

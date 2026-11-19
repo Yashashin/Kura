@@ -147,21 +147,34 @@ def _cleanup_staging(paths, stop_dir=None):
         store._prune_empty_dirs(os.path.dirname(tmp), stop_dir)
 
 
-def fixup_redirectors():
-    """Fix Up Redirectors on /Game/_AssetLib (SPEC F1 step 2)."""
+def _redirectors_under_prefix():
     ar = unreal.AssetRegistryHelpers.get_asset_registry()
     f = unreal.ARFilter(
         package_paths=[config.LIB_PREFIX], recursive_paths=True,
         class_paths=[unreal.TopLevelAssetPath("/Script/CoreUObject", "ObjectRedirector")])
-    redirectors = []
-    for ad in ar.get_assets(f) or []:
-        obj = unreal.EditorAssetLibrary.load_asset(str(ad.package_name))
-        if obj is not None:
-            redirectors.append(obj)
-    if redirectors:
-        unreal.AssetToolsHelpers.get_asset_tools().fixup_referencers(redirectors)
-        unreal.log("Kura: fixed up %d redirector(s) under %s"
-                   % (len(redirectors), config.LIB_PREFIX))
+    return sorted({str(ad.package_name) for ad in ar.get_assets(f) or []})
+
+
+def fixup_redirectors():
+    """Fix Up Redirectors on /Game/_AssetLib (SPEC F1 step 2). Returns the
+    redirectors still there afterwards - normally none.
+
+    Goes through the plugin's C++ library: IAssetTools::FixupReferencers is
+    not exposed to Python, and the AssetTools.fixup_referencers this used to
+    call does not exist on 5.7 / 5.8, so any redirector under the prefix
+    blocked the whole upload with an AttributeError (2026-11-19)."""
+    redirectors = _redirectors_under_prefix()
+    if not redirectors:
+        return []
+    # Package names, not loaded objects: a reference held here would keep a
+    # redirector alive and stop the engine deleting it. Ends with the
+    # engine's Redirector Update Report window, as the Content Browser
+    # command does; returns False (and does nothing) headless.
+    unreal.KuraThumbnailLibrary.fixup_redirectors(redirectors)
+    left = _redirectors_under_prefix()
+    unreal.log("Kura: fixed up redirectors under %s (%d left)"
+               % (config.LIB_PREFIX, len(left)))
+    return left
 
 
 def _save_dirty(packages):
@@ -254,7 +267,7 @@ def analyze(root_packages, deps_as_roots=False):
     #      froze until the compare loop started (2026-08-09).
     with progress.Reporter("Kura: reading the selection") as report:
         report(1, 4, "Fixing up redirectors")
-        fixup_redirectors()
+        left = fixup_redirectors()
         report(2, 4, "Collecting dependencies")
         d = deps.collect_fresh(roots, package_file_or_none)
         report(3, 4, "Saving modified assets")
@@ -263,6 +276,17 @@ def analyze(root_packages, deps_as_roots=False):
             report(4, 4, "Re-reading saved assets")
             deps.refresh_files([package_file_or_none(p) for p in saved])
             d = deps.collect(roots)
+
+    # A redirector that survived the fixup (the report window was cancelled,
+    # a referencer failed to save, or no editor UI to run it in) would
+    # otherwise travel into the library as an entry of its own. Stop and say
+    # what to do instead.
+    if left:
+        errors.append(
+            "Fix Up Redirectors could not clear %d redirector(s) under %s: %s"
+            " - right-click the folder in the Content Browser, choose Fix Up"
+            " Redirectors, check the Output Log for why any remain, then"
+            " send again" % (len(left), config.LIB_PREFIX, ", ".join(left)))
 
     if d["other"]:
         errors.append(
