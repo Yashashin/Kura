@@ -71,6 +71,8 @@ Every library asset keeps one stable path — `/Game/_AssetLib/...` — identica
 2. Extract it into that engine's plugin folder, so that `...\UE_5.7\Engine\Plugins\Marketplace\Kura\Kura.uplugin` exists.
 3. Start the editor, enable *Kura* in **Edit → Plugins** (its Python dependencies come along automatically) and restart when prompted.
 
+**Updating to 1.2.3:** Close the editor before replacing the installed plugin. Existing libraries and `.kurapack` files keep their format. [Read the release notes](https://github.com/Yashashin/Kura/releases/tag/v1.2.3).
+
 ## 🚀 Quick start
 
 1. **Open the panel** — **Tools → Kura Library**. On first run Kura asks where to keep your library, creates it for you and fills the Collections tree with a starting set of categories.

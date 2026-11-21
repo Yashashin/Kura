@@ -2530,6 +2530,8 @@ void KuraActions::RunRescanFlow(TSharedPtr<const SWidget> ModalParent)
 			Lines.Add(TEXT("    ") + Pair.Key);
 		}
 	}
+	AddList(TEXT("collections_error"),
+		TEXT("Collections file could not be read - no memberships were cleared"));
 	AddList(TEXT("pruned_collections"),
 		TEXT("Cleared memberships pointing at a deleted collection"));
 	AddList(TEXT("newer_schema"),

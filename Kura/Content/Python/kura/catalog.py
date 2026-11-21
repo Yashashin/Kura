@@ -21,6 +21,7 @@ No unreal imports here - this module must stay usable outside the editor
 """
 import json
 import os
+import tempfile
 import uuid
 
 from . import config, library, store
@@ -189,18 +190,58 @@ DEFAULT_TREE = (
 # collections.json I/O
 # ---------------------------------------------------------------------------
 
-def load():
+class CatalogError(RuntimeError):
+    """collections.json exists but cannot be read as a collection tree."""
+
+
+def _damaged(reason):
+    return CatalogError(
+        "The collections file cannot be read (%s): %s - Kura left it and every "
+        "asset's collection membership as they are. Restore the file from a "
+        "backup (or fix it by hand), then try again."
+        % (reason, config.COLLECTIONS_FILE))
+
+
+def load(strict=False):
     """The collection tree as {"schema_version", "collections": [...]}.
 
-    A missing / unreadable file reads as an empty tree: a library that has
-    never filed anything is a valid library, not a broken one."""
+    A missing file reads as an empty tree: a library that has never filed
+    anything is a valid library, not a broken one. An unreadable one (I/O
+    error, truncated JSON, wrong shape) reads as empty too for display - but
+    with strict=True it raises CatalogError instead, and every path that
+    writes the tree back or drops memberships based on it passes strict:
+    treating damage as "no collections" let Verify Library unfile the whole
+    library and an edit overwrite the damaged file (review 02, 2026-11-21).
+
+    Strict means the document as written, not what is left after the lenient
+    clean-up: a "collections" key that is missing or not a list (an empty
+    object included - falsy is not empty), or any node that the lenient pass
+    would drop or re-type (not an object, id / name missing, empty or not a
+    string, parent neither a string nor null) is damage, because dropping a
+    node drops its id, and every membership naming that id would then look
+    stale. What Kura itself has always written stays valid: a list (empty
+    or not), with or without schema_version, nodes without parent / order,
+    and an order that is not a number - it only sorts, and reads as 0."""
     try:
         with open(config.COLLECTIONS_FILE, encoding="utf-8") as f:
             doc = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        doc = {"collections": []}  # never created: a valid, empty tree
+    except (OSError, ValueError) as e:
+        if strict:
+            raise _damaged(e.__class__.__name__ + ": " + str(e))
         doc = {}
+    if strict:
+        problem = _structure_error(doc)
+        if problem:
+            raise _damaged(problem)
+    raw_items = doc.get("collections") if isinstance(doc, dict) else None
+    if not isinstance(raw_items, list):
+        raw_items = []
     items = []
-    for raw in doc.get("collections", []) or []:
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
         cid = str(raw.get("id", "")).strip()
         name = str(raw.get("name", "")).strip()
         if not cid or not name:
@@ -208,11 +249,34 @@ def load():
         items.append({
             "id": cid,
             "name": name,
-            "parent": str(raw.get("parent", "")).strip(),
+            "parent": str(raw.get("parent") or "").strip(),
             "order": _order(raw.get("order")),
         })
     _reparent_orphans(items)
     return {"schema_version": CATALOG_SCHEMA_VERSION, "collections": items}
+
+
+def _structure_error(doc):
+    """Why a parsed collections.json is not a collection tree, or None.
+    The strict half of load() - see there for what counts."""
+    if not isinstance(doc, dict):
+        return "the top level is not an object"
+    if "collections" not in doc:
+        return 'the "collections" list is missing'
+    nodes = doc["collections"]
+    if not isinstance(nodes, list):
+        return '"collections" is a %s, not a list' % type(nodes).__name__
+    for idx, raw in enumerate(nodes):
+        if not isinstance(raw, dict):
+            return "collection #%d is not an object" % idx
+        for key in ("id", "name"):
+            value = raw.get(key)
+            if not isinstance(value, str) or not value.strip():
+                return 'collection #%d has no usable "%s"' % (idx, key)
+        parent = raw.get("parent")
+        if parent is not None and not isinstance(parent, str):
+            return 'collection #%d has a "parent" that is not a string' % idx
+    return None
 
 
 def _order(value):
@@ -232,8 +296,27 @@ def save(doc):
                               key=lambda c: (c["parent"], c["order"],
                                              c["name"].lower())),
     }
-    with open(config.COLLECTIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    # Write beside, then swap in: opening the real file for "w" truncated it
+    # first, so a crash or a full disk mid-write left the tree half there -
+    # the damage load(strict=True) now has to refuse (review 02, 2026-11-21).
+    # The temporary name is unique per writer (mkstemp creates it
+    # exclusively), so two editors saving at once never write into - or
+    # clean up - each other's copy, and a failure removes only its own.
+    folder, base = os.path.split(config.COLLECTIONS_FILE)
+    fd, tmp = tempfile.mkstemp(prefix=base + ".", suffix=".kura-staging",
+                               dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, config.COLLECTIONS_FILE)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _reparent_orphans(items):
@@ -356,7 +439,7 @@ def _require(items, cid):
 def create(name, parent=""):
     """Add a collection under `parent` ("" = top level). Returns its new id."""
     store.require_library_root()
-    doc = load()
+    doc = load(strict=True)
     items = doc["collections"]
     parent = str(parent or "")
     if parent:
@@ -386,9 +469,10 @@ def ensure_paths(paths, dry_run=False):
     second one beside it. Backslashes are read as separators too, so a
     hand-edited manifest cannot mint a name that _check_name would later
     refuse to rename. dry_run reports what WOULD be created and writes
-    nothing - that is what the import dialog counts."""
+    nothing - that is what the import dialog counts, so only a real write
+    insists on a readable file."""
     store.require_library_root()
-    doc = load()
+    doc = load(strict=not dry_run)
     items = doc["collections"]
     known = {c["id"] for c in items}
     # (parent id, lowercased name) -> id, kept in step with `items` below.
@@ -441,7 +525,7 @@ def seed_default_tree():
 
 
 def rename(cid, name):
-    doc = load()
+    doc = load(strict=True)
     items = doc["collections"]
     c = _require(items, cid)
     c["name"] = _check_name(items, name, c["parent"], ignore_id=c["id"])
@@ -452,7 +536,7 @@ def rename(cid, name):
 def move(cid, parent="", order=None):
     """Re-parent and/or re-order a collection. Moving a node into its own
     subtree would detach that subtree from the root, so it is refused."""
-    doc = load()
+    doc = load(strict=True)
     items = doc["collections"]
     c = _require(items, cid)
     parent = str(parent or "")
@@ -482,7 +566,7 @@ def delete(cid):
     Assets are never touched beyond losing the membership line - deleting a
     collection is a filing decision, not a delete (SPEC F8). Entries left with
     no collection reappear under Unsorted."""
-    doc = load()
+    doc = load(strict=True)
     items = doc["collections"]
     _require(items, cid)
     doomed = set(_descendants(items, str(cid)))
@@ -548,7 +632,7 @@ def assign(packages, cid, add=True):
     instead of leaving it half filed (2026-11-04)."""
     cid = str(cid)
     if add:
-        _require(load()["collections"], cid)
+        _require(load(strict=True)["collections"], cid)
     metas = []
     for pkg in dict.fromkeys(str(p) for p in packages):
         meta = store.load_meta(pkg)
@@ -583,12 +667,14 @@ def assign(packages, cid, add=True):
 
 def members(cid):
     """Packages filed under a collection, nested collections included - what
-    "Import this collection" has to gather (SPEC F8)."""
+    "Import this collection" has to gather (SPEC F8). Root members only, the
+    same set list_tree() counts and the panel's grid shows (review 13): an
+    entry whose root flag was unset keeps its ids, but is not a member."""
     items = load()["collections"]
     _require(items, cid)
     out = []
     for one in _descendants(items, str(cid)):
-        for pkg in library.packages_in_collection(one):
+        for pkg in library.packages_in_collection(one, roots_only=True):
             if pkg not in out:
                 out.append(pkg)
     return sorted(out)
@@ -596,10 +682,21 @@ def members(cid):
 
 def prune_unknown():
     """Drop membership ids that no longer name a collection (F4 Verify
-    Library). Cheap self-heal for hand-edited files and interrupted deletes."""
-    known = {c["id"] for c in load()["collections"]}
+    Library). Cheap self-heal for hand-edited files and interrupted deletes.
+
+    Raises CatalogError, before any meta is touched, when the tree it would
+    judge against cannot be read - or is missing while entries still carry
+    memberships, which is the same loss seen from the other side: the ids in
+    the metas are then the only record of the filing, and clearing them made
+    restoring collections.json from a backup useless (review 02,
+    2026-11-21)."""
+    known = {c["id"] for c in load(strict=True)["collections"]}
+    metas = list(store.iter_metas())
+    if not os.path.isfile(config.COLLECTIONS_FILE) and any(
+            m.get("collections") for m in metas):
+        raise _damaged("the file is missing, but entries are still filed")
     fixed = []
-    for meta in list(store.iter_metas()):
+    for meta in metas:
         if store.meta_schema_error(meta):
             continue  # written by a newer Kura - not ours to rewrite (SPEC 5.6)
         current = meta.get("collections", [])

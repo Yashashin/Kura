@@ -59,22 +59,37 @@ def rebuild_index(progress=None, total=0):
 
     progress: optional progress(done, total, label) callable; `total` is a
     hint from the caller, since the Meta walk is a generator (this module
-    stays unreal-free - kura.editor_api supplies a kura.progress.Reporter)."""
+    stays unreal-free - kura.editor_api supplies a kura.progress.Reporter).
+
+    Drop, recreate and refill run as ONE transaction (review 04, 2026-11-21).
+    executescript() commits on its own, so the tables used to be gone and
+    empty the moment the rebuild began: a meta read failing halfway left an
+    index with no rows, which _ensure() then kept using - and with it the
+    delete guard, which reads referrers from here, let referenced entries go.
+    Now any exception rolls back to the index as it was and propagates."""
     con = _connect()
+    # Manual transaction control: sqlite3's implicit transactions do not
+    # cover DDL in every Python version, and executescript() would COMMIT.
+    con.isolation_level = None
     try:
-        con.executescript(
-            "DROP TABLE IF EXISTS collections;"
-            "DROP TABLE IF EXISTS deps;"
-            "DROP TABLE IF EXISTS tags;"
-            "DROP TABLE IF EXISTS assets;")
-        con.executescript(_SCHEMA)
-        count = 0
-        for m in store.iter_metas():
-            _insert_meta(con, m)
-            count += 1
-            if progress is not None:
-                progress(count, max(total, count), m["package"])
-        con.commit()
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            for table in ("collections", "deps", "tags", "assets"):
+                con.execute("DROP TABLE IF EXISTS %s" % table)
+            for statement in _SCHEMA.split(";"):
+                if statement.strip():
+                    con.execute(statement)
+            count = 0
+            for m in store.iter_metas():
+                _insert_meta(con, m)
+                count += 1
+                if progress is not None:
+                    progress(count, max(total, count), m["package"])
+            con.execute("COMMIT")
+        except BaseException:
+            if con.in_transaction:  # SQLite may have rolled back by itself
+                con.execute("ROLLBACK")
+            raise
         return count
     finally:
         con.close()
@@ -207,14 +222,31 @@ def search(text=None, tags=None, folder=None, roots_only=False, sort="updated",
         con.close()
 
 
-def packages_in_collection(cid):
+# A collection holds ROOTS (SPEC F8: "only roots need filing"). An entry's
+# membership ids stay in its meta when it stops being a root - Unset Root is
+# a flag edit, and setting it again should bring the filing back - but while
+# it is not a root it is not a member: not counted, not gathered by "Import
+# this collection", and not shown by the panel's collection grid, which has
+# always listed roots only. Until 2026-11-21 the counts and the import still
+# included such entries, so a collection could read 1 and show nothing
+# (review 13). The same holds for memberships older metas already carry.
+_ROOT_MEMBERS = ("SELECT c.cid, c.package FROM collections c JOIN assets a "
+                 "ON a.package = c.package WHERE a.is_root = 1")
+
+
+def packages_in_collection(cid, roots_only=False):
     """Entries assigned to a collection (SPEC F8). Lets catalog.py touch only
-    the metas that actually carry the id instead of walking the whole mirror."""
+    the metas that actually carry the id instead of walking the whole mirror.
+
+    roots_only: just the members in the F8 sense (see _ROOT_MEMBERS) - what
+    a collection holds. Without it, every entry carrying the id, which is
+    what a meta edit (deleting the collection) has to reach."""
+    sql = ("SELECT package FROM (%s) WHERE cid=? ORDER BY package"
+           % _ROOT_MEMBERS) if roots_only else \
+        "SELECT package FROM collections WHERE cid=? ORDER BY package"
     con = _ensure()
     try:
-        return [r[0] for r in con.execute(
-            "SELECT package FROM collections WHERE cid=? ORDER BY package",
-            (str(cid),))]
+        return [r[0] for r in con.execute(sql, (str(cid),))]
     finally:
         con.close()
 
@@ -222,11 +254,11 @@ def packages_in_collection(cid):
 def collection_memberships():
     """{cid: set of member packages} for every collection that has any - lets
     catalog.list_tree() roll counts up a subtree without counting an entry
-    filed in two of its branches twice."""
+    filed in two of its branches twice. Root members only (F8)."""
     con = _ensure()
     try:
         out = {}
-        for cid, package in con.execute("SELECT cid, package FROM collections"):
+        for cid, package in con.execute(_ROOT_MEMBERS):
             out.setdefault(cid, set()).add(package)
         return out
     finally:
@@ -234,11 +266,12 @@ def collection_memberships():
 
 
 def collection_counts():
-    """{cid: member count} plus "" -> number of unfiled roots (F8 Unsorted)."""
+    """{cid: member count} plus "" -> number of unfiled roots (F8 Unsorted).
+    Root members only, like everything that reads a collection (F8)."""
     con = _ensure()
     try:
         counts = {r[0]: r[1] for r in con.execute(
-            "SELECT cid, COUNT(*) FROM collections GROUP BY cid")}
+            "SELECT cid, COUNT(*) FROM (%s) GROUP BY cid" % _ROOT_MEMBERS)}
         counts[""] = con.execute(
             "SELECT COUNT(*) FROM assets WHERE is_root = 1 AND package NOT IN "
             "(SELECT package FROM collections)").fetchone()[0]
@@ -328,14 +361,7 @@ def deletable_closure(packages):
     else:
         candidates = set(non_roots)
 
-    keep = set(targets) | candidates
-    changed = True
-    while changed:
-        changed = False
-        for pkg in sorted(keep):
-            if not referrers.get(pkg, set()) <= keep:
-                keep.discard(pkg)
-                changed = True
+    keep = _self_contained(set(targets) | candidates, referrers)
 
     return {
         "deletable": sorted(keep),
@@ -345,6 +371,65 @@ def deletable_closure(packages):
         "blocked": {p: sorted(referrers.get(p, set()) - keep)
                     for p in targets if p not in keep},
     }
+
+
+def _self_contained(keep, referrers):
+    """Shrink a set to the largest subset whose every referrer lies inside
+    it - the one rule behind both the delete preview and the delete itself."""
+    keep = set(keep)
+    changed = True
+    while changed:
+        changed = False
+        for pkg in sorted(keep):
+            if not referrers.get(pkg, set()) <= keep:
+                keep.discard(pkg)
+                changed = True
+    return keep
+
+
+def deletable_subset(packages):
+    """Which of exactly these entries one delete may archive together
+    (review 09, 2026-11-21): the largest subset nothing outside it refers
+    to - the rule deletable_closure() previews, applied to what the user
+    finally ticked. Entries referencing only each other (a cycle) go
+    together; anything held from outside stays, and so does whatever it
+    holds. Returns {"deletable": [...], "blocked": {package: [outside
+    referrers, ...]}, "groups": [[...], ...]}.
+
+    groups splits "deletable" into sets connected by references (either
+    direction). Each has to leave the library whole or not at all - archiving
+    a dependency and then failing on the entry using it would leave a live
+    entry pointing at nothing - while unrelated groups need not wait on each
+    other (review 09)."""
+    wanted = list(dict.fromkeys(str(p) for p in packages))
+    con = _ensure()
+    try:
+        referrers, deps = {}, {}
+        for src, dst in con.execute("SELECT src, dst FROM deps"):
+            referrers.setdefault(dst, set()).add(src)
+            deps.setdefault(src, set()).add(dst)
+    finally:
+        con.close()
+    keep = _self_contained(wanted, referrers)
+    deletable = [p for p in wanted if p in keep]
+    groups, seen = [], set()
+    for start in deletable:
+        if start in seen:
+            continue
+        group, queue = [], [start]
+        seen.add(start)
+        while queue:
+            pkg = queue.pop()
+            group.append(pkg)
+            for other in (referrers.get(pkg, set()) | deps.get(pkg, set())):
+                if other in keep and other not in seen:
+                    seen.add(other)
+                    queue.append(other)
+        groups.append([p for p in deletable if p in set(group)])
+    return {"deletable": deletable,
+            "blocked": {p: sorted(referrers.get(p, set()) - keep)
+                        for p in wanted if p not in keep},
+            "groups": groups}
 
 
 def closure(packages):

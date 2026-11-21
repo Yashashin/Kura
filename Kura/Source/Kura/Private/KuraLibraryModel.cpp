@@ -543,9 +543,16 @@ TArray<TSharedPtr<FKuraCollectionNode>> KuraLibrary::LoadCollectionTree(
 	int32 SharedCount = 0;
 	for (const TSharedPtr<FKuraEntry>& E : Entries)
 	{
-		for (const FString& Cid : E->Collections)
+		// Roots only (SPEC F8): an entry whose root flag was unset keeps its
+		// membership ids, but the grid never lists it under the collection, so
+		// counting it made a collection read 1 and show nothing - the same
+		// rule as kura.library's root-member queries (review 13, 2026-11-21).
+		if (E->bIsRoot)
 		{
-			DirectMembers.FindOrAdd(Cid).Add(E.Get());
+			for (const FString& Cid : E->Collections)
+			{
+				DirectMembers.FindOrAdd(Cid).Add(E.Get());
+			}
 		}
 		if (E->bIsRoot && E->Collections.Num() == 0)
 		{

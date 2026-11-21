@@ -177,31 +177,53 @@ def fixup_redirectors():
     return left
 
 
-def _save_dirty(packages):
-    """Save the batch members that hold unsaved edits, so the comparison runs
-    against what is on disk (SPEC 8). Returns the packages actually saved.
+def dirty_packages(packages):
+    """[(name, UPackage)] for the given packages that hold unsaved edits.
 
-    Only a package already loaded in memory can be dirty, so ask the editor for
-    its dirty list instead of calling save_asset(pkg, only_if_dirty) per
-    package: that helper load()s the asset BEFORE it looks at the dirty flag
-    (UE 5.7 UEditorAssetSubsystem::SaveAsset), which pulled every texture in the
-    closure into memory for nothing - 1.15 s vs 0.00 s (measured 2026-08-09).
-    Both paths end in the same UEditorLoadingAndSavingUtils::SavePackages.
-    """
+    Only a package already loaded in memory can be dirty, so this asks the
+    editor for its dirty list rather than touching each package (see
+    _save_dirty for why that matters)."""
     wanted = set(packages)
-    dirty, saved = [], []
-    utils = unreal.EditorLoadingAndSavingUtils
-    for package in utils.get_dirty_content_packages():
+    out = []
+    for package in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages():
         # A UPackage's own name IS its package path; get_path_name() agrees for
         # a top-level object, and checking both keeps this honest either way.
         for name in (str(package.get_name()), str(package.get_path_name())):
             if name in wanted:
-                dirty.append(package)
-                saved.append(name)
+                out.append((name, package))
                 break
-    if dirty:
-        utils.save_packages(dirty, True)
-    return saved
+    return out
+
+
+def _save_dirty(packages):
+    """Save the batch members that hold unsaved edits, so the comparison runs
+    against what is on disk (SPEC 8). Returns (saved, failed): the packages
+    saved, and the ones still unsaved afterwards.
+
+    Asks the editor for its dirty list instead of calling
+    save_asset(pkg, only_if_dirty) per package: that helper load()s the asset
+    BEFORE it looks at the dirty flag (UE 5.7 UEditorAssetSubsystem::SaveAsset),
+    which pulled every texture in the closure into memory for nothing - 1.15 s
+    vs 0.00 s (measured 2026-08-09). Both paths end in the same
+    UEditorLoadingAndSavingUtils::SavePackages.
+
+    A save can fail (read-only file, source control lock, full disk), and the
+    edits then exist only in memory: comparing or copying the file on disk
+    would upload the old version - or call it Identical. Until 2026-11-21
+    every package was counted as saved before SavePackages ran and its result
+    was ignored (review 05). Now a package is saved only if the call reported
+    success AND the editor no longer lists it as dirty; when the call fails
+    without saying which, the whole attempt counts as failed."""
+    dirty = dirty_packages(packages)
+    if not dirty:
+        return [], []
+    names = [name for name, _package in dirty]
+    ok = unreal.EditorLoadingAndSavingUtils.save_packages(
+        [package for _name, package in dirty], True)
+    still = {name for name, _package in dirty_packages(names)}
+    if ok is False and not still:
+        still = set(names)
+    return [n for n in names if n not in still], sorted(still)
 
 
 def _direct_deps(pkg, is_pcg=False):
@@ -271,7 +293,16 @@ def analyze(root_packages, deps_as_roots=False):
         report(2, 4, "Collecting dependencies")
         d = deps.collect_fresh(roots, package_file_or_none)
         report(3, 4, "Saving modified assets")
-        saved = _save_dirty(d["game"])
+        saved, unsaved = _save_dirty(d["game"])
+        if unsaved:
+            # Stop the batch here: everything after compares and copies the
+            # files on disk, which do not hold these edits (review 05).
+            return {"ok": False, "roots": roots, "items": [], "errors": [
+                "Could not save %d modified asset(s), so the library would "
+                "get the version on disk instead of your edits - nothing was "
+                "sent. Check the Output Log for why (a read-only file or a "
+                "source control lock is the usual cause), save them, then "
+                "send again: %s" % (len(unsaved), ", ".join(unsaved))]}
         if saved:
             report(4, 4, "Re-reading saved assets")
             deps.refresh_files([package_file_or_none(p) for p in saved])
@@ -335,7 +366,13 @@ def analyze(root_packages, deps_as_roots=False):
                 errors.append("Package file missing on disk: %s (%s)" % (src, pkg))
                 continue
             size = os.path.getsize(src)
-            meta = store.load_meta(pkg)
+            try:
+                # Raises for a meta that is there but damaged or cannot be
+                # opened - existing data, never "new" (review 01).
+                meta = store.load_meta(pkg)
+            except RuntimeError as e:
+                errors.append(str(e))
+                continue
             if meta is not None:
                 # A library written by a newer Kura is read-only to this one
                 # (SPEC 5.6): overwriting the entry would drop whatever fields
@@ -345,7 +382,26 @@ def analyze(root_packages, deps_as_roots=False):
                 if schema_error:
                     errors.append(schema_error)
                     continue
+            # File and meta must agree on whether this path is taken (review
+            # 01, 2026-11-21) - see store.unregistered_file_error. An
+            # unregistered library file identical to the one being sent is
+            # what an interrupted upload leaves; registering it loses nothing.
             sha = None
+            lib_file = store.tree_file(pkg)
+            if os.path.lexists(lib_file):
+                if meta is None:
+                    if (not os.path.isfile(lib_file)
+                            or os.path.getsize(lib_file) != size):
+                        errors.append(store.unregistered_file_error(pkg))
+                        continue
+                    sha = store.sha256_of(src)
+                    slot_error = store.new_slot_error(pkg, sha)
+                    if slot_error:
+                        errors.append(slot_error)
+                        continue
+            elif meta is not None:
+                errors.append(store.missing_file_error(pkg))
+                continue
             if meta is None:
                 status, referrers = "new", []
             else:
@@ -478,6 +534,20 @@ def commit(root_packages, decisions=None, deps_as_roots=False, add_tags=None,
                 "errors": ["Staging copy failed - the library was not "
                            "modified: %s" % e]}
 
+    # Last look before anything is published (review 01): a slot planned as
+    # new must still be free - save_meta() would otherwise replace a meta
+    # that appeared after analyze() read the slot, without archiving it.
+    taken = [err for err in (store.new_slot_error(item["package"],
+                                                  meta["sha256"])
+                             for item, meta in plan if item["status"] == "new")
+             if err]
+    if taken:
+        _cleanup_staging(staged)
+        library.update_entries(promoted)  # same reason as the staging failure
+        return {"ok": False, "added": [], "updated": [], "skipped": skipped,
+                "errors": ["Upload stopped before changing the library:"]
+                + taken}
+
     # Commit: archive the old version, then rename the staged copy into
     # place (same volume, so os.replace is cheap and near-atomic).
     archive_batch = None
@@ -486,6 +556,10 @@ def commit(root_packages, decisions=None, deps_as_roots=False, add_tags=None,
             pkg = item["package"]
             if item["status"] == "conflict":
                 archive_batch = store.archive([pkg], batch_dir=archive_batch)
+            else:
+                slot_error = store.new_slot_error(pkg, meta["sha256"])
+                if slot_error:  # taken in the moment since the check above
+                    raise OSError(slot_error)
             os.replace(tmp, store.tree_file(pkg))
             store.save_meta(meta)
             (updated if item["status"] == "conflict" else added).append(pkg)

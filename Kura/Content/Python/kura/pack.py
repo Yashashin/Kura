@@ -10,9 +10,11 @@ No unreal imports here - this module must stay usable outside the editor
 (future standalone browser, SPEC 2). editor_api passes the editor's engine
 version in for the import guard.
 """
+import hashlib
 import json
 import os
 import shutil
+import tempfile
 import zipfile
 
 from . import catalog, config, library, store
@@ -109,6 +111,36 @@ def _collections_block(metas):
     return {"tree": tree, "members": members}
 
 
+class PayloadDrift(RuntimeError):
+    """A library file no longer holds the bytes its meta describes."""
+
+
+def _write_verified(z, src, arcname, meta):
+    """Stream one library file into the package, hashing exactly the bytes
+    written, and raise PayloadDrift unless they match the meta's hash and
+    size (review 14, 2026-11-21).
+
+    The manifest states the meta's hash while z.write() copied whatever the
+    file held at that moment, so a library file changed outside Kura made an
+    export that reported success and that no library would accept. Hashing
+    in the same pass costs no second read of a multi-GB payload."""
+    info = zipfile.ZipInfo.from_file(src, arcname, strict_timestamps=False)
+    info.compress_type = zipfile.ZIP_STORED
+    digest, written = hashlib.sha256(), 0
+    with open(src, "rb") as fsrc, z.open(info, "w") as dst:
+        for chunk in iter(lambda: fsrc.read(1 << 20), b""):
+            digest.update(chunk)
+            dst.write(chunk)
+            written += len(chunk)
+    if digest.hexdigest() != meta["sha256"] or written != meta["size"]:
+        raise PayloadDrift(
+            "%s: the library file no longer matches its metadata (changed "
+            "outside Kura?) - nothing was exported, and a file already at the "
+            "chosen path was left as it was. Run Verify Library, send the "
+            "asset to Kura again to record the change, then export again: %s"
+            % (meta["package"], src))
+
+
 def export_package(packages, out_path, name="", description="", author="",
                    progress=None):
     """Write the entries' live dependency closure into a .kurapack (F7).
@@ -173,16 +205,21 @@ def export_package(packages, out_path, name="", description="", author="",
     if collections:
         manifest["collections"] = collections
 
-    tmp = out_path + ".kura-staging"
+    tmp = None
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        out_dir = os.path.dirname(os.path.abspath(out_path))
+        os.makedirs(out_dir, exist_ok=True)
+        # A name of its own beside the output: two exports to one path never
+        # share - or clean up - each other's half-written file.
+        fd, tmp = tempfile.mkstemp(
+            prefix=os.path.basename(out_path) + ".", suffix=".kura-staging",
+            dir=out_dir)
+        os.close(fd)
         # strict_timestamps=False: a file dated before 1980 (zip's epoch) -
         # common after extracting some archives - is stored as 1980 instead
         # of raising ValueError and blocking the whole export (2026-11-04).
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED,
                              strict_timestamps=False) as z:
-            z.writestr(MANIFEST_NAME,
-                       json.dumps(manifest, ensure_ascii=False, indent=2))
             for idx, m in enumerate(metas, 1):
                 if progress is not None:
                     progress(idx, len(metas), m["package"])
@@ -190,8 +227,8 @@ def export_package(packages, out_path, name="", description="", author="",
                 # .uasset payloads are mostly pre-compressed textures; store
                 # them raw so multi-GB packs write at copy speed. The small
                 # json/png sidecars keep the archive's default deflate.
-                z.write(store.tree_file(m["package"]), _tree_name(rel),
-                        zipfile.ZIP_STORED)
+                _write_verified(z, store.tree_file(m["package"]),
+                                _tree_name(rel), m)
                 # Meta travels as-is except for the collection membership,
                 # whose ids only mean anything in THIS library's
                 # collections.json - which does not travel (SPEC F8). The
@@ -206,15 +243,23 @@ def export_package(packages, out_path, name="", description="", author="",
                 thumb = store.thumb_file(m["package"])
                 if os.path.isfile(thumb):
                     z.write(thumb, _thumb_name(rel))
+            # Last, so it only goes out once every payload has matched the
+            # hash it states. Readers look it up by name, not by position.
+            z.writestr(MANIFEST_NAME,
+                       json.dumps(manifest, ensure_ascii=False, indent=2))
         os.replace(tmp, out_path)
     except Exception as e:  # noqa: BLE001 - the half-written file must go
         # Broader than OSError for the same reason as commit()'s staging: any
         # other exception escaping here left a *.kura-staging next to the
-        # user's chosen path (2026-11-04).
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        # user's chosen path (2026-11-04). A file already at out_path is
+        # never touched on this path - os.replace is the only write to it.
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if isinstance(e, PayloadDrift):
+            return {"ok": False, "errors": [str(e)]}
         return {"ok": False, "errors": ["Package write failed: %s" % e]}
     return {"ok": True, "errors": [], "path": out_path,
             "entries": len(metas), "bytes": os.path.getsize(out_path)}
@@ -363,13 +408,35 @@ def preview(pack_path, current_engine=None, force_version=False, progress=None):
             for arc in (_tree_name(rel), _meta_name(rel)):
                 if arc not in names:
                     errors.append("Package is incomplete: %s is missing" % arc)
-            meta = store.load_meta(pkg)
+            try:
+                # Raises for a meta that is there but damaged or cannot be
+                # opened - existing data, never "new" (review 01).
+                meta = store.load_meta(pkg)
+            except RuntimeError as e:
+                errors.append(str(e))
+                continue
             # Newer-Kura entry on THIS side: the manifest check above only
             # covers the schema the package itself carries (SPEC 5.6).
             local_schema_error = (store.meta_schema_error(meta)
                                   if meta is not None else None)
             if local_schema_error:
                 errors.append(local_schema_error)
+                continue
+            # The file and the meta must agree on whether this path is taken
+            # (review 01, 2026-11-21): a file without meta used to be replaced
+            # as "new" with no archive copy, a meta without file was "same"
+            # and the file stayed missing. An unregistered file that is
+            # byte-identical to the incoming one is the leftover of an
+            # interrupted import - replacing it loses nothing.
+            local_file = store.tree_file(pkg)
+            has_file = os.path.lexists(local_file)
+            slot_error = (store.new_slot_error(pkg, entry.get("sha256"))
+                          if meta is None else None)
+            if slot_error:
+                errors.append(slot_error)
+                continue
+            if meta is not None and not has_file:
+                errors.append(store.missing_file_error(pkg))
                 continue
             if meta is None:
                 status, referrers = "new", []
@@ -438,6 +505,13 @@ def _stage_meta(z, arc, tmp, pkg, sha256):
     if meta.get("sha256") != sha256:
         raise ValueError("%s: the meta in the package disagrees with the "
                          "manifest about the file's hash" % pkg)
+    # Readable is not enough: a meta missing what the index and every reader
+    # need would land, then break Verify Library and the index (review 07).
+    # Staging is the safe point - nothing is published yet.
+    shape_error = store.meta_shape_error(meta)
+    if shape_error:
+        raise ValueError("%s: the meta in the package is not a usable entry "
+                         "(%s)" % (pkg, shape_error))
     local = store.load_meta(pkg)
     meta["collections"] = list((local or {}).get("collections") or [])
     with open(tmp, "w", encoding="utf-8") as f:
@@ -615,6 +689,19 @@ def commit(pack_path, decisions=None, current_engine=None, force_version=False,
                 "errors": ["Package staging failed - the library was not "
                            "modified: %s" % e]}
 
+    # Last look before anything is published (review 01): a slot planned as
+    # new must still be free - preview()'s read is only as current as the
+    # moment it ran, and a "new" item's meta rename would replace whatever
+    # meta has appeared since without archiving it.
+    taken = [err for err in (store.new_slot_error(i["package"], i["sha256"])
+                             for i, _files in staged if i["status"] == "new")
+             if err]
+    if taken:
+        _cleanup_staged(staged)
+        return {"ok": False, "added": [], "updated": [], "skipped": skipped,
+                "errors": ["Package import stopped before changing the "
+                           "library:"] + taken}
+
     # Commit: archive the old version of each conflict, then rename the
     # staged copies into place (same volume, near-atomic).
     added, updated = [], []
@@ -624,6 +711,10 @@ def commit(pack_path, decisions=None, current_engine=None, force_version=False,
             pkg = item["package"]
             if item["status"] == "conflict":
                 archive_batch = store.archive([pkg], batch_dir=archive_batch)
+            else:
+                slot_error = store.new_slot_error(pkg, item["sha256"])
+                if slot_error:  # taken in the moment since the check above
+                    raise OSError(slot_error)
             for tmp, final in files:
                 os.replace(tmp, final)
             (updated if item["status"] == "conflict" else added).append(pkg)

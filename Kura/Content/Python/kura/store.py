@@ -5,6 +5,7 @@ No unreal imports here - this module must stay usable outside the editor
 (future standalone browser, SPEC 2).
 """
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -171,26 +172,86 @@ def load_meta(package):
 
     A meta that exists but cannot be parsed (truncated by a crash or a full
     disk) is neither: it raises, naming the file, so a caller cannot mistake
-    the entry for absent and the user is told where to look (D1, 2026-11-17)."""
+    the entry for absent and the user is told where to look (D1, 2026-11-17).
+
+    The same goes for one that exists but cannot be OPENED - a sharing
+    violation, a permission or I/O error. Only "no such file" means absent:
+    every other OSError used to read as None too, so an import whose asset
+    file happened to be identical took the entry for an unregistered leftover
+    and replaced the meta, locally edited notes and tags with it (FIX-014
+    review 01, 2026-11-21)."""
     path = meta_file(package)
     try:
         with open(path, encoding="utf-8") as f:
             meta = json.load(f)
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as e:
+        raise RuntimeError(
+            "The metadata file for %s exists but cannot be read (%s): %s - "
+            "nothing was changed. Close whatever holds it open, or check the "
+            "disk and its permissions, then try again." % (package, e, path))
     except ValueError:
         meta = None
-    if not _is_entry_meta(meta):
+    # Parseable but unusable counts as damaged too (review 07): refusing here
+    # stops every write and import at the read, before anything is changed.
+    problem = "not valid JSON" if meta is None else meta_shape_error(meta)
+    if problem:
         raise RuntimeError(
-            "The metadata file for %s is damaged and cannot be read: %s - "
-            "run Verify Library to list damaged entries, then send the asset "
-            "to Kura again or restore the file from a backup."
-            % (package, path))
+            "The metadata file for %s is damaged and cannot be read (%s): %s "
+            "- run Verify Library to list damaged entries, then send the "
+            "asset to Kura again or restore the file from a backup."
+            % (package, problem, path))
     return meta
 
 
 def _is_entry_meta(meta):
-    return isinstance(meta, dict) and isinstance(meta.get("package"), str)
+    return meta_shape_error(meta) is None
+
+
+# Fields every reader relies on being there: the index writes each one into a
+# NOT NULL column by key (library._insert_meta), import / export / Verify read
+# them directly. Everything else is optional - older metas simply lack it.
+_REQUIRED_STR = ("package", "class", "sha256", "engine_version",
+                 "ingested_at", "updated_at")
+_OPTIONAL_STR = ("source_project", "notes")
+_OPTIONAL_STR_LIST = ("tags", "hard_deps", "engine_deps", "collections",
+                      "required_plugins")
+
+
+def meta_shape_error(meta):
+    """None if a parsed meta can be read as an entry, else what is wrong.
+
+    Valid JSON that is not a usable entry used to pass on a "package" string
+    alone, then fail later with a KeyError inside Verify Library or the index
+    rebuild - taking every other entry's report with it (review 07,
+    2026-11-21). Checks what the readers actually use: the required strings,
+    a non-negative integer size, the optional strings / string lists when
+    present (a bare string where a list belongs would be iterated character
+    by character) and is_root as a flag. Missing optionals are fine - that is
+    every meta older than the field. schema_version is left to
+    meta_schema_error()."""
+    if not isinstance(meta, dict):
+        return "not a JSON object"
+    for key in _REQUIRED_STR:
+        if not isinstance(meta.get(key), str) or not meta[key]:
+            return 'missing or invalid "%s"' % key
+    if not meta["package"].startswith(config.LIB_PREFIX + "/"):
+        return '"package" is not under %s' % config.LIB_PREFIX
+    size = meta.get("size")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        return 'missing or invalid "size"'
+    for key in _OPTIONAL_STR:
+        if key in meta and not isinstance(meta[key], str):
+            return '"%s" is not a string' % key
+    for key in _OPTIONAL_STR_LIST:
+        value = meta.get(key, [])
+        if not isinstance(value, list) or not all(
+                isinstance(v, str) for v in value):
+            return '"%s" is not a list of strings' % key
+    if "is_root" in meta and not isinstance(meta["is_root"], (bool, int)):
+        return '"is_root" is not a flag'
+    return None
 
 
 def save_meta(meta):
@@ -200,6 +261,11 @@ def save_meta(meta):
     schema_error = meta_schema_error(meta)
     if schema_error:
         raise RuntimeError(schema_error)
+    # Never write a meta the readers would reject (review 07).
+    shape_error = meta_shape_error(meta)
+    if shape_error:
+        raise RuntimeError("Refusing to write metadata for %s: %s"
+                           % (meta.get("package", "<unknown>"), shape_error))
     path = meta_file(meta["package"])
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -208,6 +274,70 @@ def save_meta(meta):
 
 def exists(package):
     return os.path.isfile(meta_file(package))
+
+
+# ---------------------------------------------------------------------------
+# File / meta agreement at one stable path (2026-11-21, review 01)
+# ---------------------------------------------------------------------------
+# Whether a path is taken used to be read off the meta alone. An asset file
+# with no meta beside it then counted as a free slot - Import Package and Send
+# to Kura replaced it as "new" without archiving it, and Move Folder moved
+# over it - while a meta whose file was gone counted as a whole entry, so a
+# re-import reported it identical and left the file missing. Every write path
+# that decides "new / same / conflict" or "is the destination free" asks
+# these first.
+
+def unregistered_file_error(package):
+    """The slot holds an asset file but no meta: Kura cannot know what the
+    file is, so it must not be replaced or moved over."""
+    return ("%s: the library folder already holds an asset file at this path, "
+            "but no metadata for it (Verify Library lists it under Files "
+            "without meta), so Kura cannot tell what it would replace. The "
+            "file was left as it is - move it out of the library folder or "
+            "restore its .json, then try again: %s"
+            % (package, tree_file(package)))
+
+
+def missing_file_error(package):
+    """The slot holds a meta but no asset file: treating it as a complete
+    entry would report a re-import as identical and leave the file missing."""
+    return ("%s: the library has metadata for this entry but its asset file is "
+            "missing (Verify Library lists it under Meta without file). "
+            "Nothing was changed - put the .uasset back, or delete the entry "
+            "(it goes to Recently Deleted), then try again: %s"
+            % (package, tree_file(package)))
+
+
+def new_slot_error(package, sha256):
+    """None if a package planned as NEW may still be published, else why not.
+
+    Checked again right before anything is renamed into place, after staging:
+    the preview's verdict is only as current as its read, and something can
+    take the slot in between - a meta written by another editor, an asset
+    file that is not the one being placed. Anything there at all (even an
+    entry that cannot be opened) counts as taken; only an asset file whose
+    bytes are exactly the incoming ones may stay, which is the interrupted-
+    import recovery (FIX-014 review 01)."""
+    if os.path.lexists(meta_file(package)):
+        return ("%s: metadata for this entry appeared in the library while "
+                "the operation was running, so nothing was replaced: %s"
+                % (package, meta_file(package)))
+    tree = tree_file(package)
+    if os.path.lexists(tree):
+        try:
+            same = os.path.isfile(tree) and sha256_of(tree) == sha256
+        except OSError:
+            same = False
+        if not same:
+            return unregistered_file_error(package)
+    return None
+
+
+def occupied_files(package):
+    """Library files present at a package's stable path - asset, meta and
+    thumbnail. A destination is free only when this is empty."""
+    return [p for p in (tree_file(package), meta_file(package),
+                        thumb_file(package)) if os.path.isfile(p)]
 
 
 def iter_metas(unreadable=None):
@@ -251,27 +381,139 @@ def iter_metas(unreadable=None):
 # Archive (SPEC 5.1: never hard-delete)
 # ---------------------------------------------------------------------------
 
+class ArchiveRolledBack(OSError):
+    """archive() could not move every file and put back what it had moved.
+
+    `stuck` lists (live path, archived path) pairs it could NOT put back -
+    empty when the library is exactly as it was. Anything stuck is still in
+    the batch, restorable; the message names each one."""
+
+    def __init__(self, cause, stuck, batch_dir):
+        self.cause, self.stuck, self.batch_dir = cause, list(stuck), batch_dir
+        if self.stuck:
+            text = ("Archiving stopped (%s) and %d file(s) could not be put "
+                    "back - they are safe in %s and restorable from Recently "
+                    "Deleted: %s" % (cause, len(self.stuck), batch_dir,
+                                     ", ".join(a for _l, a in self.stuck)))
+        else:
+            text = ("Archiving stopped (%s) - every file was put back, nothing "
+                    "was deleted" % cause)
+        super().__init__(text)
+
+
+def rename_no_replace(src, dst):
+    """Rename src to dst only if nothing is at dst - decided atomically by
+    the file system, never by a check followed by a rename.
+
+    A check-then-replace lets another writer finish a file at dst in between
+    and then destroys it (FIX-014 review 08, second round). Windows - the
+    platform Kura ships on - gives this for free: os.rename is MoveFileEx
+    without MOVEFILE_REPLACE_EXISTING and fails with FileExistsError when dst
+    exists. POSIX rename() silently replaces, so there the file is hard-linked
+    into place (link() fails on an existing name) and the old name dropped.
+    A file system without hard links refuses with an OSError - the safe way
+    to fail. Raises FileExistsError when dst was taken; src is then
+    untouched."""
+    if os.name == "nt":
+        os.rename(src, dst)
+        return
+    os.link(src, dst)
+    try:
+        os.remove(src)
+    except OSError:
+        os.remove(dst)  # ours: link() just made it - back to one name
+        raise
+
+
+def _move_file(src, dst):
+    """Move one file without ever replacing what is at dst.
+
+    A rename where possible - the archive lives in the library root, so on
+    one volume - which either happens whole or not at all: a file another
+    program holds without delete sharing simply stays where it is.
+    shutil.move() fell back to copy + delete there, which can leave a copy
+    behind when the delete is refused. Across volumes (an _archive junction
+    to another drive) it copies into a file it creates exclusively, and
+    takes the copy back if the original cannot be removed."""
+    try:
+        rename_no_replace(src, dst)
+        return
+    except OSError as e:
+        if e.errno != errno.EXDEV and getattr(e, "winerror", None) != 17:
+            raise
+    with open(src, "rb") as fsrc, open(dst, "xb") as fdst:
+        try:
+            shutil.copyfileobj(fsrc, fdst, 1 << 20)
+        except BaseException:
+            fdst.close()
+            os.remove(dst)  # created above, so ours
+            raise
+    try:
+        shutil.copystat(src, dst)
+        os.remove(src)
+    except OSError:
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        raise
+
+
 def archive(packages, batch_dir=None):
     """Move entries' tree files + meta (+ thumbnail) into a timestamped
     _archive batch folder, preserving relative paths. Returns the batch dir.
-    """
-    if batch_dir is None:
+
+    All or nothing for the packages given (FIX-014 review 09, 2026-11-21):
+    file by file, a locked .uasset or .json used to stop the call with some
+    entries - or half of one - already gone, while the index and the live
+    referrers still pointed at them. Now every file moved is moved back on
+    the first failure, and ArchiveRolledBack (an OSError, so every caller's
+    existing handling applies) says whether that fully worked. Callers pass
+    the entries that must go together - a delete group, one conflict."""
+    created = batch_dir is None
+    if created:
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         batch_dir = os.path.join(config.ARCHIVE_DIR, stamp)
         n = 0
         while os.path.isdir(batch_dir):  # same-second batches
             n += 1
             batch_dir = os.path.join(config.ARCHIVE_DIR, "%s_%d" % (stamp, n))
+    moved = []    # (live, archived), in move order
+    folders = []  # every batch folder a destination needed - the failed one too
+    try:
+        for package in packages:
+            rel = rel_path(package)
+            for src, sub in ((tree_file(package), "Content"),
+                             (meta_file(package), "Meta"),
+                             (thumb_file(package), "Meta")):
+                if os.path.isfile(src):
+                    dst = os.path.join(batch_dir, sub, *rel.split("/")) \
+                        + os.path.splitext(src)[1]
+                    folders.append(os.path.dirname(dst))
+                    os.makedirs(folders[-1], exist_ok=True)
+                    _move_file(src, dst)
+                    moved.append((src, dst))
+    except OSError as e:
+        stuck = []
+        for live, archived in reversed(moved):
+            try:
+                os.makedirs(os.path.dirname(live), exist_ok=True)
+                _move_file(archived, live)
+            except OSError:
+                stuck.append((live, archived))
+        # Including the folder made for the file that refused to move: it
+        # held nothing, and left behind it kept an empty batch alive in
+        # Recently Deleted (review 09, second round). Only empty folders go,
+        # so a batch this call was appending to keeps everything in it.
+        for folder in folders:
+            _prune_empty_dirs(folder, batch_dir)
+        if created and not stuck:
+            try:
+                os.rmdir(batch_dir)
+            except OSError:
+                pass
+        raise ArchiveRolledBack(e, stuck, batch_dir)
     for package in packages:
-        rel = rel_path(package)
-        for src, sub in ((tree_file(package), "Content"),
-                         (meta_file(package), "Meta"),
-                         (thumb_file(package), "Meta")):
-            if os.path.isfile(src):
-                dst = os.path.join(batch_dir, sub, *rel.split("/")) \
-                    + os.path.splitext(src)[1]
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.move(src, dst)
         _prune_empty_dirs(os.path.dirname(tree_file(package)), config.TREE_DIR)
         _prune_empty_dirs(os.path.dirname(meta_file(package)), config.META_DIR)
     return batch_dir

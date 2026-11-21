@@ -1,8 +1,11 @@
 """Headless self-test drivers: asset-tree round-trip + master uniqueness
 (the SPEC 9 acceptance chain), run across two throwaway projects.
 
-In the host project:   import kura.selftest as s; s.run_host_test()
-In the target project: import kura.selftest as s; s.run_target_test()
+Run them through Tests/local/run_headless.ps1, never by hand: the host run
+deletes /Game/_AssetLib and /Game/TestAssets in its project and fills the
+library, the target run imports into /Game/_AssetLib. The launcher creates
+both projects and the library fresh and marks them; require_disposable()
+refuses to start anywhere else (review 06, 2026-11-21).
 
 Test chain (created procedurally, laid out by the SPEC 5.4 convention:
 a root plus its exclusive deps per folder, shared assets parked centrally):
@@ -48,8 +51,113 @@ def _check(cond, msg):
         raise RuntimeError("Kura selftest FAILED: %s" % msg)
 
 
+# ---------------------------------------------------------------------------
+# Disposable-run guard (review 06, 2026-11-21)
+# ---------------------------------------------------------------------------
+# The launcher used to take any -HostProject / -TargetProject and isolated
+# only the library, and run_host_test() called by hand archived the
+# configured library's entries and removed its collections.json. Now
+# run_headless.ps1 writes one random token into a marker file in each project
+# folder and in the library root and hands the same token over in the
+# environment; nothing here deletes or resets anything until both markers
+# match it and the folders the run is about to own are empty.
+
+MARKER_NAME = "kura_selftest.marker"
+TOKEN_ENV = "KURA_SELFTEST_TOKEN"
+
+
+def _test_folders():
+    return (config.LIB_PREFIX, "/Game/TestAssets")
+
+
+def _project_dir():
+    return os.path.dirname(os.path.normpath(ingest.content_dir()))
+
+
+def _project_files(game_folder):
+    """Files on disk under one /Game folder of the current project."""
+    root = os.path.join(ingest.content_dir(),
+                        *game_folder[len("/Game/"):].split("/"))
+    return [os.path.join(d, f) for d, _s, fs in os.walk(root) for f in fs]
+
+
+def _read_marker(folder):
+    try:
+        with open(os.path.join(folder, MARKER_NAME), encoding="utf-8-sig") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def require_disposable(mode):
+    """Raise unless this run's project and library are the throwaway ones
+    run_headless.ps1 made for it. mode: "host" | "target".
+
+    Both modes: the token is set, the project folder and the library root
+    carry it, and the project holds nothing yet under the folders the test
+    creates and deletes. Host only: the library is empty apart from its
+    marker - the target run reads the library the host run just filled."""
+    token = os.environ.get(TOKEN_ENV, "").strip()
+    if not token:
+        raise RuntimeError(
+            "Kura selftest refused to run - nothing was deleted: %s is not "
+            "set. The selftest deletes test folders in its project and "
+            "rewrites its library, so it only runs in the throwaway project "
+            "and library Tests/local/run_headless.ps1 creates." % TOKEN_ENV)
+    problems = []
+    for label, folder in (("project", _project_dir()),
+                          ("library", config.LIBRARY_ROOT)):
+        if _read_marker(folder) != token:
+            problems.append("the %s folder %s does not carry this run's %s"
+                            % (label, folder, MARKER_NAME))
+    for game_folder in _test_folders():
+        files = _project_files(game_folder)
+        if files:
+            problems.append("the project already holds %d file(s) under %s, "
+                            "e.g. %s" % (len(files), game_folder, files[0]))
+    if mode == "host":
+        top = os.path.normcase(os.path.normpath(config.LIBRARY_ROOT))
+        files = [os.path.join(d, f)
+                 for d, _s, fs in os.walk(config.LIBRARY_ROOT) for f in fs
+                 if not (f == MARKER_NAME
+                         and os.path.normcase(os.path.normpath(d)) == top)]
+        if files:
+            problems.append("the library %s is not empty: %d file(s), e.g. %s"
+                            % (config.LIBRARY_ROOT, len(files), files[0]))
+    if problems:
+        raise RuntimeError("Kura selftest refused to run - nothing was "
+                           "deleted:\n    " + "\n    ".join(problems))
+
+
 def _asset_sub():
     return unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)
+
+
+def _save_fixture_packages(packages):
+    """Save exactly these fixture packages, where they hold unsaved changes,
+    and fail unless every one of them really saved. Returns the names saved.
+
+    Never a global save (save_dirty_packages and friends): this test loads
+    engine and plugin content - the /PCG/ built-in subgraph - and anything
+    of that which the engine marks dirty would be written back into the
+    engine installation, outside the throwaway project (FIX-014 review 06).
+    A redirector is a package like any other here: the one a rename leaves
+    behind shows up in the dirty list under the old name and saves under
+    it. Only packages under the library prefix may be passed in at all."""
+    prefix = config.LIB_PREFIX + "/"
+    outside = sorted(str(p) for p in packages if not str(p).startswith(prefix))
+    _check(not outside, "only fixture packages under %s may be saved, not: %s"
+           % (config.LIB_PREFIX, outside))
+    dirty = ingest.dirty_packages(packages)
+    if not dirty:
+        return []
+    names = [name for name, _package in dirty]
+    ok = unreal.EditorLoadingAndSavingUtils.save_packages(
+        [package for _name, package in dirty], True)
+    _check(ok is True, "saving %s failed (returned %r)" % (names, ok))
+    still = [name for name, _package in ingest.dirty_packages(names)]
+    _check(not still, "still unsaved after saving: %s" % still)
+    return names
 
 
 def _statuses(result):
@@ -122,18 +230,17 @@ def _run_seed_check():
 
 
 def _reset_library():
-    """Archive every existing entry so the run starts from an empty tree."""
-    # The run may point at a library that does not exist yet. Create it the
-    # way first-run setup does - the index no longer makes the root on its
-    # own (2026-11-17).
+    """Lay out the empty throwaway library the run starts from.
+
+    require_disposable() has already refused anything but an empty, marked
+    root - this used to archive whatever entries it found and delete
+    collections.json, which on a real library is somebody's work (review 06).
+    Created the way first-run setup does - the index no longer makes the
+    root on its own (2026-11-17)."""
     store.ensure_library_dirs()
-    packages = [m["package"] for m in store.iter_metas()]
-    if packages:
-        batch = store.archive(packages)
-        unreal.log_warning("Kura selftest: archived %d pre-existing entr(ies) "
-                           "to %s" % (len(packages), batch))
-    if os.path.isfile(config.COLLECTIONS_FILE):
-        os.remove(config.COLLECTIONS_FILE)  # F8 tree is per-run state too
+    _check(not list(store.iter_metas())
+           and not os.path.isfile(config.COLLECTIONS_FILE),
+           "the throwaway library must start empty")
     library.rebuild_index()
 
 
@@ -142,10 +249,11 @@ def _make_assets():
     at = unreal.AssetToolsHelpers.get_asset_tools()
     mel = unreal.MaterialEditingLibrary
 
-    for folder in (config.LIB_PREFIX, "/Game/TestAssets"):
-        if sub.does_directory_exist(folder):
-            unreal.log_warning("Kura selftest: deleting leftover %s" % folder)
-            sub.delete_directory(folder)
+    # Never delete a leftover: in a fresh project there is none, and anywhere
+    # else it is not ours (review 06; require_disposable checked the disk).
+    for folder in _test_folders():
+        _check(not sub.does_directory_exist(folder),
+               "%s must not exist before the test creates it" % folder)
 
     # texture: duplicate an engine texture (file import asserts headless)
     src = None
@@ -337,6 +445,7 @@ def _run_pcg_checks():
 
 def run_host_test():
     """Ingest side (F1) in the host project."""
+    require_disposable("host")  # before anything is touched
     sub = _asset_sub()
     _reset_library()
     _run_seed_check()
@@ -514,7 +623,14 @@ def _run_redirector_check():
         _check(sub.rename_asset(RD_OLD, RD_NEW), "rename the texture")
     finally:
         cm.destroy_collection(coll)
-    unreal.EditorLoadingAndSavingUtils.save_dirty_packages(False, True)
+    # The rename leaves the redirector at RD_OLD, the renamed texture at
+    # RD_NEW and possibly the fixed-up MI unsaved. Save exactly those: a
+    # save_dirty_packages() here wrote EVERY dirty content package - the
+    # /PCG/ built-in subgraph the PCG checks had loaded included, i.e. a file
+    # inside the engine installation (FIX-014 review 06, found by Codex).
+    _save_fixture_packages([RD_OLD, RD_NEW, RD_MI])
+    _check(all(ingest.package_file_or_none(p) for p in (RD_OLD, RD_NEW)),
+           "the redirector and the renamed texture must both be on disk")
     deps.refresh_files([ingest.package_to_file(RD_OLD)])
     _check(ingest._redirectors_under_prefix() == [RD_OLD],
            "renaming must leave a redirector to test against: %s"
@@ -734,10 +850,10 @@ def _run_update_keeps_filing_check():
 
 def run_target_test():
     """Import side (F3) in the target project."""
+    require_disposable("target")  # before anything is touched
     sub = _asset_sub()
-    if sub.does_directory_exist(config.LIB_PREFIX):
-        unreal.log_warning("Kura selftest: deleting leftover %s" % config.LIB_PREFIX)
-        sub.delete_directory(config.LIB_PREFIX)
+    _check(not sub.does_directory_exist(config.LIB_PREFIX),
+           "%s must not exist before the import creates it" % config.LIB_PREFIX)
 
     # --- import MI_AA: closure copies exactly MI_AA + M_A + T ---
     r = importer.commit([AA])
@@ -783,14 +899,56 @@ def run_target_test():
     _check(r["ok"] and r["kept"] == [MA], "keep decision: %s" % r)
     _check(store.sha256_of(ingest.package_to_file(MA))
            != store.load_meta(MA)["sha256"], "keep must not touch project M_A")
+    _check(unreal.find_package(MA) is not None,
+           "the overwrite check needs M_A loaded, as it is after a local edit")
     r = importer.commit([AA], {MA: "overwrite"})
     _check(r["ok"] and r["copied"] == [MA], "overwrite decision: %s" % r)
     _check(store.sha256_of(ingest.package_to_file(MA))
            == store.load_meta(MA)["sha256"], "overwrite must restore library M_A")
+    # The file alone is not enough (review 03, 2026-11-21): the M_A already
+    # in memory must be the library version too - one-sided was the local
+    # edit, the library holds the two-sided one - and so must the master its
+    # loaded instance points at, or the next save writes the edit back.
+    _check(sub.load_asset(MA).get_editor_property("two_sided") is True,
+           "overwrite must reload the M_A already loaded in this editor")
+    parent = sub.load_asset(AA).get_editor_property("parent")
+    _check(parent is not None and parent.get_editor_property("two_sided") is True,
+           "a loaded MI_AA must point at the reloaded M_A")
+    del parent  # no Python reference may pin an M_A the next reload replaces
+    _run_dirty_overwrite_check()
 
     pcg_result = _run_pcg_import_checks()
     unreal.log_warning("Kura selftest TARGET PASS (round-trip intact, master "
                        "unique, conflict flow verified; %s)" % pcg_result)
+
+
+def _run_dirty_overwrite_check():
+    """Unsaved edits refuse an Overwrite before any file moves (review 03):
+    the decision was made against the file on disk, and reloading over the
+    edits would throw away work nobody was asked about. Ends the way it
+    found M_A - the library version, reloaded."""
+    sub = _asset_sub()
+    _modify_master(False)  # saved: the file now differs from the library
+    mat = sub.load_asset(MA)
+    mat.modify()           # and an unsaved edit on top of it
+    _check(ingest.dirty_packages([MA]),
+           "M_A must be dirty for the unsaved-edit check")
+    before = store.sha256_of(ingest.package_to_file(MA))
+    r = importer.commit([AA], {MA: "overwrite"})
+    _check(not r["ok"] and not r["copied"]
+           and any("unsaved changes" in e and MA in e for e in r["errors"]),
+           "an overwrite over unsaved edits must refuse, naming them: %s" % r)
+    _check(store.sha256_of(ingest.package_to_file(MA)) == before,
+           "a refused overwrite must leave the project file alone")
+    _check(not any(f.endswith(".kura-staging")
+                   for _d, _s, fs in os.walk(ingest.content_dir()) for f in fs),
+           "a refused overwrite must not stage anything")
+    del mat
+    _check(sub.save_asset(MA, False), "save M_A after the refused overwrite")
+    r = importer.commit([AA], {MA: "overwrite"})
+    _check(r["ok"] and r["copied"] == [MA], "overwrite after saving: %s" % r)
+    _check(sub.load_asset(MA).get_editor_property("two_sided") is True,
+           "the second overwrite must reload M_A as well")
 
 
 def _run_pcg_import_checks():

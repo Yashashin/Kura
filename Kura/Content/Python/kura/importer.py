@@ -79,14 +79,62 @@ def preview(packages, force_version=False):
     return {"ok": True, "errors": [], "items": items}
 
 
+def _loaded(packages):
+    """The packages among these that are in memory in this editor right now.
+    find_package never loads anything - it only looks."""
+    return [p for p in packages if unreal.find_package(p) is not None]
+
+
+def _reload_unavailable():
+    return not hasattr(unreal.EditorLoadingAndSavingUtils, "reload_packages")
+
+
+def _reload(packages):
+    """Reload already-loaded packages from the files just copied over them.
+    Returns error lines, empty on success.
+
+    Same engine path as a source-control revert (UPackageTools::
+    ReloadPackages): the in-memory objects are replaced and every loaded
+    referencer is pointed at the new ones. ASSUME_NEGATIVE: never discard
+    unsaved edits - commit() refuses dirty packages before copying, so one
+    only gets here if something dirtied it since, and then it is reported."""
+    if not packages:
+        return []
+    dirty = {name for name, _package in ingest.dirty_packages(packages)}
+    todo = [p for p in packages if p not in dirty]
+    failed, message = sorted(dirty), ""
+    targets = [t for t in (unreal.find_package(p) for p in todo)
+               if t is not None]
+    if targets:
+        result = unreal.EditorLoadingAndSavingUtils.reload_packages(
+            targets, unreal.ReloadPackagesInteractionMode.ASSUME_NEGATIVE)
+        del targets  # let the replaced packages go
+        reloaded, message = ((tuple(result) + (False, ""))[:2]
+                             if isinstance(result, tuple) else (result, ""))
+        message = str(message or "").strip()
+        if message or not reloaded:
+            failed = sorted(set(failed) | set(todo))
+    if not failed:
+        return []
+    return ["The library version is on disk, but %d asset(s) already loaded "
+            "in this editor could not be reloaded%s: %s. Restart the editor "
+            "before you save any of them - saving the copy still in memory "
+            "would write the old version back over the file."
+            % (len(failed), " (%s)" % message if message else "",
+               ", ".join(failed))]
+
+
 def commit(packages, decisions=None, force_version=False):
     """Copy the closure into the project (F3 3-4).
 
     decisions: {package: "overwrite" | "keep"} for every conflict item.
     "overwrite" replaces the project file with the library version (the old
     project file is NOT archived - the library archive only guards library
-    data; the UI must warn about this). Returns {"ok", "copied", "skipped",
-    "kept", "errors", "roots"}.
+    data; the UI must warn about this). A package to be replaced that holds
+    unsaved edits refuses the whole import; one that is merely loaded is
+    reloaded from the new file, and a reload failure comes back as ok False
+    with the files already copied (review 03). Returns {"ok", "copied",
+    "skipped", "kept", "errors", "roots"}.
     """
     decisions = dict(decisions or {})
     p = preview(packages, force_version=force_version)
@@ -111,6 +159,31 @@ def commit(packages, decisions=None, force_version=False):
             kept.append(pkg)
         else:
             to_copy.append(pkg)
+
+    # A file Kura replaces may belong to a package this editor already has in
+    # memory (review 03, 2026-11-21). Replacing only the file used to leave
+    # the old object live: the editor kept showing it, and the next save
+    # wrote it back over the library version. So: unsaved edits refuse the
+    # import before anything is copied (Overwrite was chosen against the file
+    # on disk, not against edits that exist only in memory), and whatever is
+    # loaded gets reloaded once the files are in place - or, where this
+    # editor cannot reload, refuses up front too.
+    dirty = sorted(name for name, _package in ingest.dirty_packages(to_copy))
+    if dirty:
+        return {"ok": False, "copied": [], "skipped": skipped, "kept": kept,
+                "roots": [], "errors": [
+                    "%d asset(s) to be replaced have unsaved changes in this "
+                    "editor - nothing was copied. Save or revert them, then "
+                    "import again: %s"
+                    % (len(dirty), ", ".join(dirty))]}
+    loaded = _loaded(to_copy)
+    if loaded and _reload_unavailable():
+        return {"ok": False, "copied": [], "skipped": skipped, "kept": kept,
+                "roots": [], "errors": [
+                    "%d asset(s) to be replaced are loaded in this editor, and "
+                    "this editor cannot reload them in place - nothing was "
+                    "copied. Restart the editor without opening them, then "
+                    "import again: %s" % (len(loaded), ", ".join(loaded))]}
 
     # Stage first: copy every library file next to its destination, so a
     # copy failure (lock, network drive, disk full) aborts before any
@@ -139,16 +212,19 @@ def commit(packages, decisions=None, force_version=False):
             copied.append(pkg)
     except OSError as e:
         ingest._cleanup_staging(staged, stop_dir=ingest.content_dir())
+        deps.refresh_files([package_to_file(pkg) for pkg in copied])
         return {"ok": False, "copied": copied, "skipped": skipped,
                 "kept": kept, "roots": [],
                 "errors": ["Import interrupted after %d of %d file(s): %s - "
                            "the project may hold a mixed closure; re-run the "
-                           "import" % (len(copied), len(to_copy), e)]}
+                           "import" % (len(copied), len(to_copy), e)]
+                + _reload([p for p in loaded if p in copied])}
 
     # Register exactly what was written, so the Content Browser sees it. A
     # force-rescan of the whole LIB_PREFIX used to sit here and re-read every
     # package header in the project instead (2026-08-09).
     deps.refresh_files([package_to_file(pkg) for pkg in copied])
+    reload_errors = _reload(loaded)
 
     roots = [str(pkg) for pkg in packages]
     # Content Browser sync is a Slate call and hard-asserts (uncatchable from
@@ -160,7 +236,10 @@ def commit(packages, decisions=None, force_version=False):
         except Exception:
             pass
 
-    unreal.log("Kura: import done - copied %d, skipped %d (identical), kept %d"
-               % (len(copied), len(skipped), len(kept)))
-    return {"ok": True, "errors": [], "copied": copied, "skipped": skipped,
-            "kept": kept, "roots": roots}
+    unreal.log("Kura: import done - copied %d (%d reloaded in place), skipped "
+               "%d (identical), kept %d"
+               % (len(copied), len(loaded), len(skipped), len(kept)))
+    # The files are in place either way; a failed reload is still a failure
+    # the user must hear about, since the stale copy in memory can be saved.
+    return {"ok": not reload_errors, "errors": reload_errors, "copied": copied,
+            "skipped": skipped, "kept": kept, "roots": roots}

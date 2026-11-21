@@ -24,14 +24,51 @@
 
 namespace
 {
-	/** Shared dialog state: the Import button acts on the last scan. */
+	/** Shared dialog state: the Import button acts on the last scan - and
+	 *  only while that scan still describes the fields (review 10). */
 	struct FPbrState
 	{
 		bool bFlipGreen = false;
 		int32 NumReady = 0;   // sets without errors in the last scan
 		int32 NumBlocked = 0;
 		bool bScanned = false;
+		bool bStale = false;  // a scan was shown, then the fields moved on
+		// Exactly what the last successful scan read. Import is only offered
+		// - and only runs - for these values: the button used to stay enabled
+		// on the last scan's READY count while the click read whatever the
+		// boxes held by then, so the preview could show A and import B.
+		FString ScannedFolder;
+		FString ScannedCategory;
 	};
+
+	FString FieldValue(const TSharedRef<SEditableTextBox>& Box)
+	{
+		return Box->GetText().ToString().TrimStartAndEnd();
+	}
+
+	/** The preview no longer describes what Import would do: a field was
+	 *  edited, or a scan failed. Drop it, so the button cannot act on it. */
+	void InvalidatePreview(const TSharedRef<SVerticalBox>& PreviewBox,
+		const TSharedRef<FPbrState>& State)
+	{
+		if (State->bScanned)
+		{
+			State->bStale = true;
+		}
+		PreviewBox->ClearChildren();
+		State->NumReady = 0;
+		State->NumBlocked = 0;
+		State->bScanned = false;
+		State->ScannedFolder.Reset();
+		State->ScannedCategory.Reset();
+	}
+
+	/** Gate for Import, checked by the button AND again by its click. */
+	bool PreviewIsCurrent(const FPbrState& State, const FString& Folder, const FString& Category)
+	{
+		return State.bScanned && State.NumReady > 0
+			&& Folder == State.ScannedFolder && Category == State.ScannedCategory;
+	}
 
 	TArray<FString> StringArray(const TSharedPtr<FJsonObject>& Obj, const TCHAR* Field)
 	{
@@ -180,11 +217,24 @@ void KuraPbrImporter::RunFlow(TSharedPtr<const SWidget> ModalParent)
 	const TSharedRef<FPbrState> State = MakeShared<FPbrState>();
 	State->bFlipGreen = bDefaultFlip;
 
+	const TSharedRef<SVerticalBox> PreviewBox = SNew(SVerticalBox);
+
+	// Editing either field the scan read makes its preview stale (review 10).
+	// The Import gate compares the values as well, so a programmatic SetText
+	// (the Browse button) cannot slip past even if it raises no event.
 	const TSharedRef<SEditableTextBox> FolderBox = SNew(SEditableTextBox)
-		.HintText(LOCTEXT("PbrFolderHint", "folder whose subfolders are one texture set each"));
+		.HintText(LOCTEXT("PbrFolderHint", "folder whose subfolders are one texture set each"))
+		.OnTextChanged_Lambda([PreviewBox, State](const FText&)
+		{
+			InvalidatePreview(PreviewBox, State);
+		});
 	const TSharedRef<SEditableTextBox> CategoryBox = SNew(SEditableTextBox)
 		.Text(FText::FromString(DefaultCategory))
-		.HintText(LOCTEXT("PbrCategoryHint", "e.g. Materials - each set gets its own folder under it"));
+		.HintText(LOCTEXT("PbrCategoryHint", "e.g. Materials - each set gets its own folder under it"))
+		.OnTextChanged_Lambda([PreviewBox, State](const FText&)
+		{
+			InvalidatePreview(PreviewBox, State);
+		});
 	const TSharedRef<SEditableTextBox> MasterBox = SNew(SEditableTextBox)
 		.Text(FText::FromString(DefaultMaster))
 		.HintText(LOCTEXT("PbrMasterHint", "/Game/_AssetLib/Shared/Master/M_YourMaster"));
@@ -195,8 +245,6 @@ void KuraPbrImporter::RunFlow(TSharedPtr<const SWidget> ModalParent)
 		.SupportsMaximize(false)
 		.SupportsMinimize(false);
 	const TWeakPtr<SWindow> WeakWindow = Window;
-
-	const TSharedRef<SVerticalBox> PreviewBox = SNew(SVerticalBox);
 
 	const auto LabeledRow = [](const FText& Label, TSharedRef<SWidget> Field) -> TSharedRef<SWidget>
 	{
@@ -294,9 +342,11 @@ void KuraPbrImporter::RunFlow(TSharedPtr<const SWidget> ModalParent)
 						"Dry run: show what would be imported and wired up, without touching any assets"))
 					.OnClicked_Lambda([FolderBox, CategoryBox, PreviewBox, State, ModalParent]()
 					{
+						const FString Folder = FieldValue(FolderBox);
+						const FString Category = FieldValue(CategoryBox);
 						const FString Statement = FString::Printf(TEXT("pbr_scan('%s', '%s')"),
-							*KuraPython::EscapePyStr(FolderBox->GetText().ToString().TrimStartAndEnd()),
-							*KuraPython::EscapePyStr(CategoryBox->GetText().ToString().TrimStartAndEnd()));
+							*KuraPython::EscapePyStr(Folder),
+							*KuraPython::EscapePyStr(Category));
 						const TSharedPtr<FJsonObject> Result = KuraPython::Call(Statement);
 						bool bOk = false;
 						if (Result.IsValid())
@@ -318,11 +368,17 @@ void KuraPbrImporter::RunFlow(TSharedPtr<const SWidget> ModalParent)
 							{
 								Errors.Add(TEXT("Scan failed - see Output Log for details."));
 							}
+							// A failed scan leaves nothing to import: the previous
+							// preview no longer applies (review 10).
+							InvalidatePreview(PreviewBox, State);
 							KuraActions::ShowErrorsDialog(
 								LOCTEXT("PbrScanFailed", "PBR Importer - Scan Failed"), Errors, ModalParent);
 							return FReply::Handled();
 						}
 						FillPreview(PreviewBox, State, Result);
+						State->bStale = false;
+						State->ScannedFolder = Folder;
+						State->ScannedCategory = Category;
 						return FReply::Handled();
 					})
 				]
@@ -348,8 +404,11 @@ void KuraPbrImporter::RunFlow(TSharedPtr<const SWidget> ModalParent)
 					{
 						if (!State->bScanned)
 						{
-							return LOCTEXT("PbrHintScan",
-								"Scan first - nothing is imported until you confirm.");
+							return State->bStale
+								? LOCTEXT("PbrHintRescan",
+									"The source or destination changed, a scan failed, or an import just ran - Scan again before importing.")
+								: LOCTEXT("PbrHintScan",
+									"Scan first - nothing is imported until you confirm.");
 						}
 						return FText::Format(LOCTEXT("PbrSummary",
 							"{0} {0}|plural(one=set,other=sets) ready, {1} blocked. Review, then import and Send to Kura yourself."),
@@ -360,14 +419,30 @@ void KuraPbrImporter::RunFlow(TSharedPtr<const SWidget> ModalParent)
 				[
 					SNew(SButton)
 					.Text(LOCTEXT("PbrImport", "Import"))
-					.IsEnabled_Lambda([State]() { return State->NumReady > 0; })
+					.IsEnabled_Lambda([State, FolderBox, CategoryBox]()
+					{
+						return PreviewIsCurrent(*State, FieldValue(FolderBox), FieldValue(CategoryBox));
+					})
 					.ToolTipText(LOCTEXT("PbrImportTip",
 						"Import the READY sets: textures with correct settings, one MI per set under the master. BLOCKED sets are skipped."))
 					.OnClicked_Lambda([FolderBox, CategoryBox, MasterBox, PreviewBox, State, WeakWindow, ModalParent]()
 					{
+						// Checked again at execution, not only by the enabled
+						// state: a click can land between an edit and the next
+						// repaint (review 10). Runs with the values the preview
+						// was made from.
+						if (!PreviewIsCurrent(*State, FieldValue(FolderBox), FieldValue(CategoryBox)))
+						{
+							InvalidatePreview(PreviewBox, State);
+							KuraActions::ShowErrorsDialog(
+								LOCTEXT("PbrStaleTitle", "PBR Importer - Scan Again"),
+								TArray<FString>{ FString(TEXT("The source or destination folder changed since the last Scan (or that scan failed), so the preview no longer shows what would be imported. Nothing was imported - Scan again, review, then import.")) },
+								ModalParent);
+							return FReply::Handled();
+						}
 						const FString Statement = FString::Printf(TEXT("pbr_commit('%s', '%s', '%s', %s)"),
-							*KuraPython::EscapePyStr(FolderBox->GetText().ToString().TrimStartAndEnd()),
-							*KuraPython::EscapePyStr(CategoryBox->GetText().ToString().TrimStartAndEnd()),
+							*KuraPython::EscapePyStr(State->ScannedFolder),
+							*KuraPython::EscapePyStr(State->ScannedCategory),
 							*KuraPython::EscapePyStr(MasterBox->GetText().ToString().TrimStartAndEnd()),
 							State->bFlipGreen ? TEXT("True") : TEXT("False"));
 						const TSharedPtr<FJsonObject> Result = KuraPython::Call(Statement);
@@ -397,6 +472,9 @@ void KuraPbrImporter::RunFlow(TSharedPtr<const SWidget> ModalParent)
 									Lines.Add(V->AsString());
 								}
 							}
+							// The project changed under the preview (sets created,
+							// failed ones rolled back): scan again before a retry.
+							InvalidatePreview(PreviewBox, State);
 							KuraActions::ShowErrorsDialog(
 								LOCTEXT("PbrCommitFailed", "PBR Importer - Finished With Errors"), Lines, ModalParent);
 							return FReply::Handled();

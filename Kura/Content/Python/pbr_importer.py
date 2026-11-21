@@ -240,6 +240,12 @@ if unreal:
 
 
 def _import_texture(src, folder, dest, rule, flip_green):
+    """Import one texture and save it. Returns (texture, problem): problem is
+    None on success, else what went wrong, naming the asset path.
+
+    The save result counts (review 12, 2026-11-21): save_loaded_asset() was
+    called and ignored, so a texture that never reached disk still went into
+    an MI reported as created - and was gone after an editor restart."""
     task = unreal.AssetImportTask()
     task.filename = src
     task.destination_path = folder
@@ -248,9 +254,10 @@ def _import_texture(src, folder, dest, rule, flip_green):
     task.save = False
     task.replace_existing = False
     unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
-    tex = unreal.load_asset("%s/%s.%s" % (folder, dest, dest))
+    path = "%s/%s" % (folder, dest)
+    tex = unreal.load_asset("%s.%s" % (path, dest))
     if not tex:
-        return None
+        return None, "failed to import %s as %s" % (os.path.basename(src), path)
     # Import settings are the easy-to-forget half of the manual workflow.
     tex.set_editor_property("srgb", bool(rule["srgb"]))
     tex.set_editor_property("compression_settings",
@@ -258,8 +265,107 @@ def _import_texture(src, folder, dest, rule, flip_green):
                                             COMPRESSION["default"]))
     if rule["type"] == "Normal" and flip_green:
         tex.set_editor_property("flip_green_channel", True)
-    unreal.EditorAssetLibrary.save_loaded_asset(tex, False)
-    return tex
+    if not unreal.EditorAssetLibrary.save_loaded_asset(tex, False):
+        return tex, "failed to save %s" % path
+    return tex, None
+
+
+def _remove_created(paths, set_name):
+    """Delete the assets THIS attempt created for a set that did not finish,
+    newest first (the MI before the textures it references). Returns error
+    lines for any that could not be removed.
+
+    Only paths this attempt made are ever passed in: scan() blocks a set
+    whose targets already exist, and commit() re-checks each one right
+    before creating it, so an asset that was there before is never touched
+    (review 11, 2026-11-21). Leaving the made ones behind is what used to
+    block the retry: the next Scan found the textures and called the whole
+    set taken."""
+    problems = []
+    for path in reversed(paths):
+        try:
+            if not _asset_exists(path):
+                continue
+            if not unreal.EditorAssetLibrary.delete_asset(path) \
+                    or _asset_exists(path):
+                raise RuntimeError("the editor refused to delete it")
+        except Exception as e:  # noqa: BLE001 - report, then try the rest
+            problems.append("%s: could not remove %s, created by this attempt "
+                            "(%s) - delete it by hand, then import again"
+                            % (set_name, path, e))
+    return problems
+
+
+def _exists_quietly(path):
+    """_asset_exists() for bookkeeping after a failure: an answer that cannot
+    be had counts as "not ours", so it is never deleted."""
+    try:
+        return _asset_exists(path)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _build_set(info, set_folder, rules_by_type, master, flip_green,
+               can_switch, tools, mel, made):
+    """Create one set's textures and MI, each saved. Returns None on success,
+    else what failed, naming the target path.
+
+    `made` collects every asset path THIS attempt created, in creation order,
+    for the caller to roll back - also one whose creating call then raised:
+    each target is checked absent right before its call, and present again
+    in a finally, whatever the call did. Until the correction to 11 / 12
+    (2026-11-21) only False results were handled; a RuntimeError from an
+    import, a property setter or a save escaped commit() with the set half
+    made, and the leftovers blocked the retry."""
+    textures, target = [], None
+    try:
+        for item in info["textures"]:
+            rule = rules_by_type[item["type"]]
+            target = "%s/%s" % (set_folder, item["dest"])
+            if _asset_exists(target):
+                return ("%s already exists (it appeared after the scan) - "
+                        "left as it is" % target)
+            try:
+                tex, problem = _import_texture(item["path"], set_folder,
+                                               item["dest"], rule, flip_green)
+            finally:
+                if _exists_quietly(target):
+                    made.append(target)  # ours: it was not there a moment ago
+            if problem:
+                return problem
+            textures.append((rule, tex))
+
+        target = info["mi"]
+        if _asset_exists(target):
+            return ("%s already exists (it appeared after the scan) - left as "
+                    "it is" % target)
+        mi = None
+        try:
+            mi = tools.create_asset("MI_%s" % info["name"], set_folder,
+                                    unreal.MaterialInstanceConstant,
+                                    unreal.MaterialInstanceConstantFactoryNew())
+            if not mi:
+                return "failed to create material instance %s" % target
+            mel.set_material_instance_parent(mi, master)
+            for rule, tex in textures:
+                if can_switch:
+                    mel.set_material_instance_static_switch_parameter_value(
+                        mi, rule["switch"], True)
+                mel.set_material_instance_texture_parameter_value(
+                    mi, rule["param"], tex)
+            mel.update_material_instance(mi)
+            if not unreal.EditorAssetLibrary.save_loaded_asset(mi, False):
+                return "failed to save %s" % target
+        finally:
+            mi = None  # no reference may keep it alive for the rollback
+            if _exists_quietly(target):
+                made.append(target)
+        return None
+    except Exception as e:  # noqa: BLE001 - one set must not stop the batch
+        return ("the editor raised an error while creating %s (%s: %s)"
+                % (target or set_folder, e.__class__.__name__, e))
+    finally:
+        del textures[:]  # let go of the textures before they are deleted
 
 
 class _Progress:
@@ -334,38 +440,20 @@ def commit(root_dir, category, master_path, flip_green=False):
                 continue
             set_folder = "%s/%s/%s" % (prefix, category, info["name"])
 
-            textures, failed = [], False
-            for item in info["textures"]:
-                rule = rules_by_type[item["type"]]
-                tex = _import_texture(item["path"], set_folder, item["dest"],
-                                      rule, flip_green)
-                if not tex:
-                    errors.append("%s: failed to import %s"
-                                  % (info["name"], item["file"]))
-                    failed = True
-                    break
-                textures.append((rule, tex))
-            if failed:
+            # A set is all or nothing (reviews 11 / 12): every texture and
+            # the MI must be created AND saved, or what this attempt made is
+            # removed again and the set is reported skipped with the path
+            # that failed - so fixing the source and importing again works.
+            made = []
+            failure = _build_set(info, set_folder, rules_by_type, master,
+                                 flip_green, can_switch, tools, mel, made)
+            if failure:
+                errors.append("%s: %s - the set was not imported, and what "
+                              "this attempt had created for it is removed"
+                              % (info["name"], failure))
+                errors.extend(_remove_created(made, info["name"]))
                 skipped.append(info["name"])
                 continue
-
-            mi = tools.create_asset("MI_%s" % info["name"], set_folder,
-                                    unreal.MaterialInstanceConstant,
-                                    unreal.MaterialInstanceConstantFactoryNew())
-            if not mi:
-                errors.append("%s: failed to create material instance"
-                              % info["name"])
-                skipped.append(info["name"])
-                continue
-            mel.set_material_instance_parent(mi, master)
-            for rule, tex in textures:
-                if can_switch:
-                    mel.set_material_instance_static_switch_parameter_value(
-                        mi, rule["switch"], True)
-                mel.set_material_instance_texture_parameter_value(
-                    mi, rule["param"], tex)
-            mel.update_material_instance(mi)
-            unreal.EditorAssetLibrary.save_loaded_asset(mi, False)
             created.append(info["mi"])
 
     cfg = _load_config()
